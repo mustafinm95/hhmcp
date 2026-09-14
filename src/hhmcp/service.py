@@ -21,7 +21,7 @@ from .models import (
     SearchSpec,
     Vacancy,
 )
-from .parsing import parse_employer_page, parse_salary, parse_vacancy_page, validate_search_url
+from .parsing import parse_employer_page, parse_vacancy_page, validate_search_url
 from .repository import Repository
 
 DETAIL_TTL = timedelta(days=1)
@@ -68,21 +68,6 @@ def search_url(spec: SearchSpec) -> str:
     return "https://hh.ru/search/vacancy?" + urlencode(params)
 
 
-def _salary(text: str | None):
-    parsed = parse_salary(text)
-    if not parsed:
-        return None
-    from .models import Salary
-
-    return Salary(
-        lower=parsed.lower,
-        upper=parsed.upper,
-        currency=parsed.currency,
-        period=parsed.period,
-        gross=parsed.gross,
-    )
-
-
 class Collector:
     def __init__(self, data_dir: Path, *, headless: bool = True):
         self.data_dir = data_dir
@@ -105,18 +90,32 @@ class Collector:
         progress.active_vacancies = []
         self.repo.set_progress(run_id, progress)
 
-    async def collect(self, run_id: str, *, refresh: bool = False) -> None:
+    async def collect(
+        self,
+        run_id: str,
+        *,
+        refresh: bool = False,
+        vacancy_cache_ttl: timedelta = DETAIL_TTL,
+    ) -> None:
         lock = CollectorLock(self.data_dir / "collector.lock")
         try:
             with lock:
-                await self._collect_locked(run_id, refresh=refresh)
+                await self._collect_locked(
+                    run_id, refresh=refresh, vacancy_cache_ttl=vacancy_cache_ttl
+                )
         except Exception as exc:
             if self.repo.get_run(run_id).state not in ("paused", "cancelled"):
                 self.repo.set_run_state(run_id, "failed", str(exc), False)
                 self.finish_progress(run_id)
             raise
 
-    async def _collect_locked(self, run_id: str, *, refresh: bool) -> None:
+    async def _collect_locked(
+        self,
+        run_id: str,
+        *,
+        refresh: bool,
+        vacancy_cache_ttl: timedelta = DETAIL_TTL,
+    ) -> None:
         run = self.repo.get_run(run_id)
         self.repo.set_run_state(run_id, "running")
         with self.repo.db.transaction() as con:
@@ -201,7 +200,11 @@ class Collector:
                     await save_progress()
                     try:
                         if not await self._process_job(
-                            worker_browser, run_id, job, refresh
+                            worker_browser,
+                            run_id,
+                            job,
+                            refresh,
+                            vacancy_cache_ttl,
                         ):
                             stop_workers.set()
                     finally:
@@ -377,34 +380,24 @@ class Collector:
         async for value in browser.iter_search_pages(url):
             yield value
 
-    async def _process_job(self, browser, run_id: str, job, refresh: bool) -> bool:
+    async def _process_job(
+        self,
+        browser,
+        run_id: str,
+        job,
+        refresh: bool,
+        vacancy_cache_ttl: timedelta = DETAIL_TTL,
+    ) -> bool:
         payload = json.loads(job["payload_json"])
-        observed = payload.get("observed")
-        effective_refresh = refresh
-        if observed and not refresh:
-            try:
-                cached, _ = self.repo.get_vacancy(job["target"])
-                effective_refresh = bool(
-                    (observed.get("title") and observed["title"] != cached.title)
-                    or (
-                        observed.get("employer_name")
-                        and observed["employer_name"] != cached.employer_name
-                    )
-                    or (
-                        observed.get("salary_text")
-                        and _salary(observed["salary_text"]) != cached.salary
-                    )
-                )
-            except KeyError:
-                pass
         self.repo.start_job(job["id"])
         try:
             _, from_cache = await self._load_vacancy(
                 browser,
                 job["target"],
                 payload.get("url") or f"https://hh.ru/vacancy/{job['target']}",
-                effective_refresh,
+                refresh,
                 job["id"],
+                vacancy_cache_ttl,
             )
             if from_cache:
                 self.repo.finish_job(job["id"], "cached")
@@ -424,12 +417,13 @@ class Collector:
         url: str,
         refresh: bool,
         job_id: int | None = None,
+        cache_ttl: timedelta = DETAIL_TTL,
     ):
         if not refresh:
             try:
                 cached, meta = self.repo.get_vacancy(vacancy_id)
                 age = datetime.now(UTC) - datetime.fromisoformat(meta["fetched_at"])
-                if age <= DETAIL_TTL and meta["parser_version"] == PARSER_VERSION:
+                if age <= cache_ttl and meta["parser_version"] == PARSER_VERSION:
                     cached.cache_age_seconds = int(age.total_seconds())
                     return cached, True
             except KeyError:

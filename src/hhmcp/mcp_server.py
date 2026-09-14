@@ -4,6 +4,7 @@ import asyncio
 import atexit
 import json
 from contextlib import asynccontextmanager
+from datetime import timedelta
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -60,9 +61,18 @@ def _reserve_collector() -> CollectorLock:
     return lock
 
 
-async def _run_collection(run_id: str, refresh: bool, lock: CollectorLock) -> None:
+async def _run_collection(
+    run_id: str,
+    refresh: bool,
+    lock: CollectorLock,
+    vacancy_cache_ttl_hours: int = 24,
+) -> None:
     try:
-        await collector._collect_locked(run_id, refresh=refresh)
+        await collector._collect_locked(
+            run_id,
+            refresh=refresh,
+            vacancy_cache_ttl=timedelta(hours=vacancy_cache_ttl_hours),
+        )
     except asyncio.CancelledError:
         if collector.repo.get_run(run_id).state != "cancelled":
             collector.repo.set_run_state(run_id, "interrupted", "MCP server stopped", False)
@@ -83,8 +93,15 @@ def _consume_task_result(task: asyncio.Task[None]) -> None:
 
 
 @mcp.tool()
-async def start_collection(searches: list[dict], limit: int = 1000, refresh: bool = False) -> dict:
+async def start_collection(
+    searches: list[dict],
+    limit: int = 1000,
+    refresh: bool = False,
+    vacancy_cache_ttl_hours: int = 24,
+) -> dict:
     """Start a background collection and immediately return its run id."""
+    if vacancy_cache_ttl_hours < 0:
+        raise ValueError("vacancy_cache_ttl_hours must be non-negative")
     specs = [SearchSpec.model_validate(x) for x in searches]
     lock = _reserve_collector()
     try:
@@ -93,7 +110,9 @@ async def start_collection(searches: list[dict], limit: int = 1000, refresh: boo
         lock.release()
         raise
     reservations[run_id] = lock
-    tasks[run_id] = asyncio.create_task(_run_collection(run_id, refresh, lock))
+    tasks[run_id] = asyncio.create_task(
+        _run_collection(run_id, refresh, lock, vacancy_cache_ttl_hours)
+    )
     tasks[run_id].add_done_callback(_consume_task_result)
     await asyncio.sleep(0)
     return {"run_id": run_id, "state": "queued"}
@@ -115,14 +134,22 @@ async def cancel_collection(run_id: str) -> dict:
 
 
 @mcp.tool()
-async def resume_collection(run_id: str, refresh: bool = False) -> dict:
+async def resume_collection(
+    run_id: str,
+    refresh: bool = False,
+    vacancy_cache_ttl_hours: int = 24,
+) -> dict:
+    if vacancy_cache_ttl_hours < 0:
+        raise ValueError("vacancy_cache_ttl_hours must be non-negative")
     run = collector.repo.get_run(run_id)
     if run.state == "completed" and run.complete:
         raise ValueError(f"run cannot be resumed from {run.state}")
     lock = _reserve_collector()
     collector.cancelled.discard(run_id)
     reservations[run_id] = lock
-    tasks[run_id] = asyncio.create_task(_run_collection(run_id, refresh, lock))
+    tasks[run_id] = asyncio.create_task(
+        _run_collection(run_id, refresh, lock, vacancy_cache_ttl_hours)
+    )
     tasks[run_id].add_done_callback(_consume_task_result)
     await asyncio.sleep(0)
     return {"run_id": run_id, "state": "queued"}
@@ -252,7 +279,14 @@ def delete_saved_search(name: str) -> dict:
 
 
 @mcp.tool()
-async def run_saved_searches(names: list[str], limit: int = 1000, refresh: bool = False) -> dict:
+async def run_saved_searches(
+    names: list[str],
+    limit: int = 1000,
+    refresh: bool = False,
+    vacancy_cache_ttl_hours: int = 24,
+) -> dict:
+    if vacancy_cache_ttl_hours < 0:
+        raise ValueError("vacancy_cache_ttl_hours must be non-negative")
     lock = _reserve_collector()
     with collector.repo.db.connect() as con:
         rows = [
@@ -265,7 +299,9 @@ async def run_saved_searches(names: list[str], limit: int = 1000, refresh: bool 
     specs = [SearchSpec.model_validate_json(row[0]) for row in rows if row]
     run_id = collector.start(specs, limit)
     reservations[run_id] = lock
-    tasks[run_id] = asyncio.create_task(_run_collection(run_id, refresh, lock))
+    tasks[run_id] = asyncio.create_task(
+        _run_collection(run_id, refresh, lock, vacancy_cache_ttl_hours)
+    )
     tasks[run_id].add_done_callback(_consume_task_result)
     await asyncio.sleep(0)
     return {"run_id": run_id, "state": "queued"}

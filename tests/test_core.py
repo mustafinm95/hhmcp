@@ -220,7 +220,7 @@ async def test_batch_limit_dedup_and_error_consumes_slot(tmp_path, monkeypatch):
             url = filters["text"]
             return pages[url][0], url
 
-    async def fake_load(self, browser, vacancy_id, url, refresh, job_id=None):
+    async def fake_load(self, browser, vacancy_id, url, refresh, job_id=None, cache_ttl=None):
         if vacancy_id == "2":
             raise ValueError("broken fixture")
         self.repo.save_vacancy_and_finish_job(vacancy(vacancy_id), job_id)
@@ -258,7 +258,7 @@ async def test_mcp_explicit_cancel_stays_cancelled(tmp_path, monkeypatch):
     run_id = local.start([SearchSpec(text="python")])
     blocker = asyncio.Event()
 
-    async def wait_forever(_run_id, *, refresh):
+    async def wait_forever(_run_id, *, refresh, vacancy_cache_ttl):
         await blocker.wait()
 
     monkeypatch.setattr(server, "collector", local)

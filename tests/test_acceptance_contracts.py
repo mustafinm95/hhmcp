@@ -56,7 +56,7 @@ async def test_batch_accepts_exactly_1000_unique_ids_with_duplicates_and_errors(
         SECOND_URL: [SearchPage(second[i : i + 200], None) for i in range(0, len(second), 200)],
     }
 
-    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None, _observed=None):
+    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None, _cache_ttl=None):
         if int(vacancy_id) % 100 == 0:
             raise ValueError("damaged vacancy page")
         value = vacancy(vacancy_id)
@@ -120,7 +120,7 @@ async def test_resume_requeues_and_completes_a_job_left_running_by_a_crash(tmp_p
             ),
         )
 
-    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None, _observed=None):
+    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None, _cache_ttl=None):
         value = vacancy(vacancy_id)
         self.repo.save_vacancy_and_finish_job(value, job_id)
         return value, False
@@ -154,7 +154,7 @@ async def test_successful_job_has_one_atomic_outcome_and_matching_counters(tmp_p
     }
     monkeypatch.setattr("hhmcp.service.BrowserAdapter", PageBrowser)
 
-    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None, _observed=None):
+    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None, _cache_ttl=None):
         if vacancy_id == "2":
             raise RuntimeError("parse failed")
         value = vacancy(vacancy_id)
@@ -198,18 +198,27 @@ class DetailBrowser:
 
 
 @pytest.mark.asyncio
-async def test_vacancy_ttl_cache_is_bypassed_only_by_refresh(tmp_path):
+async def test_vacancy_cache_uses_configured_ttl_and_refresh_bypasses_it(tmp_path):
     collector = Collector(tmp_path)
     cached = vacancy(title="Cached")
     cached.fetched_at = datetime.now(UTC) - timedelta(hours=23)
     collector.repo.save_vacancy_and_finish_job(cached)
     browser = DetailBrowser()
 
-    value, from_cache = await collector._load_vacancy(browser, "1", cached.url, False)
+    value, from_cache = await collector._load_vacancy(
+        browser, "1", cached.url, False, cache_ttl=timedelta(hours=24)
+    )
     assert (value.title, from_cache, browser.fetches) == ("Cached", True, 0)
 
-    value, from_cache = await collector._load_vacancy(browser, "1", cached.url, True)
+    value, from_cache = await collector._load_vacancy(
+        browser, "1", cached.url, False, cache_ttl=timedelta(hours=1)
+    )
     assert (value.title, from_cache, browser.fetches) == ("Fresh", False, 1)
+
+    value, from_cache = await collector._load_vacancy(
+        browser, "1", cached.url, True, cache_ttl=timedelta(hours=24)
+    )
+    assert (value.title, from_cache, browser.fetches) == ("Fresh", False, 2)
 
 
 @pytest.mark.asyncio
@@ -229,34 +238,41 @@ async def test_old_parser_version_invalidates_fresh_detail_cache(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_listing_mismatch_invalidates_a_fresh_detail_cache(tmp_path, monkeypatch):
+async def test_second_run_reuses_processed_vacancy_despite_listing_mismatch(
+    tmp_path, monkeypatch
+):
     collector = Collector(tmp_path)
-    cached = vacancy(title="Old title")
-    cached.fetched_at = datetime.now(UTC)
-    collector.repo.save_vacancy_and_finish_job(cached)
 
-    class MismatchBrowser(PageBrowser):
+    class RepeatedBrowser(PageBrowser):
         fetches = 0
+        searches = 0
 
         async def iter_search_pages(self, url):
-            yield SearchPage([SearchItem("1", cached.url, title="New title")], None), url
+            type(self).searches += 1
+            title = "Original listing" if self.searches == 1 else "Changed listing"
+            yield SearchPage(
+                [SearchItem("1", "https://hh.ru/vacancy/1", title=title)], None
+            ), url
 
         async def fetch_html(self, url, *, readiness):
             type(self).fetches += 1
             return (
-                '<h1 data-qa="vacancy-title">New title</h1>'
+                '<h1 data-qa="vacancy-title">Stored detail</h1>'
                 '<div data-qa="vacancy-description">Description</div>',
                 url,
             )
 
-    monkeypatch.setattr("hhmcp.service.BrowserAdapter", MismatchBrowser)
-    run_id = collector.start([SearchSpec(url=SEARCH_URL)])
-    await collector.collect(run_id)
+    monkeypatch.setattr("hhmcp.service.BrowserAdapter", RepeatedBrowser)
+    first_run = collector.start([SearchSpec(url=SEARCH_URL)])
+    await collector.collect(first_run)
+    second_run = collector.start([SearchSpec(url=SEARCH_URL)])
+    await collector.collect(second_run)
 
     current, _ = collector.repo.get_vacancy("1")
-    assert MismatchBrowser.fetches == 1
-    assert current.title == "New title"
-    assert collector.repo.get_run(run_id).cached == 0
+    assert RepeatedBrowser.fetches == 1
+    assert current.title == "Stored detail"
+    assert collector.repo.get_run(first_run).loaded == 1
+    assert collector.repo.get_run(second_run).cached == 1
 
 
 class TrackingLock:
@@ -292,7 +308,7 @@ async def test_mcp_cancel_before_background_coroutine_starts_releases_lock(tmp_p
     lock = TrackingLock()
     blocker = asyncio.Event()
 
-    async def wait_forever(_run_id, *, refresh):
+    async def wait_forever(_run_id, *, refresh, vacancy_cache_ttl):
         await blocker.wait()
 
     monkeypatch.setattr(server, "collector", local)
@@ -315,7 +331,7 @@ async def test_mcp_background_exception_releases_lock(tmp_path, monkeypatch):
     run_id = local.start([SearchSpec(text="python")])
     lock = TrackingLock()
 
-    async def fail(_run_id, *, refresh):
+    async def fail(_run_id, *, refresh, vacancy_cache_ttl):
         raise RuntimeError("collector crashed")
 
     monkeypatch.setattr(server, "collector", local)
@@ -323,6 +339,44 @@ async def test_mcp_background_exception_releases_lock(tmp_path, monkeypatch):
     with pytest.raises(RuntimeError, match="collector crashed"):
         await server._run_collection(run_id, False, lock)
     assert lock.released
+
+
+@pytest.mark.asyncio
+async def test_mcp_forwards_configured_vacancy_cache_ttl(tmp_path, monkeypatch):
+    import hhmcp.mcp_server as server
+
+    local = Collector(tmp_path)
+    run_id = local.start([SearchSpec(text="python")])
+    lock = TrackingLock()
+    received = None
+
+    async def collect(resumed_id, *, refresh, vacancy_cache_ttl):
+        nonlocal received
+        assert resumed_id == run_id
+        assert refresh is False
+        received = vacancy_cache_ttl
+
+    monkeypatch.setattr(server, "collector", local)
+    monkeypatch.setattr(local, "_collect_locked", collect)
+
+    await server._run_collection(run_id, False, lock, vacancy_cache_ttl_hours=6)
+
+    assert received == timedelta(hours=6)
+    assert lock.released
+
+
+@pytest.mark.asyncio
+async def test_mcp_rejects_negative_vacancy_cache_ttl(monkeypatch):
+    import hhmcp.mcp_server as server
+
+    monkeypatch.setattr(
+        server,
+        "_reserve_collector",
+        lambda: pytest.fail("invalid TTL must be rejected before reserving collector"),
+    )
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        await server.start_collection([], vacancy_cache_ttl_hours=-1)
 
 
 @pytest.mark.asyncio
@@ -337,7 +391,7 @@ async def test_mcp_public_resume_accepts_orphaned_incomplete_state(
     local.repo.set_run_state(run_id, orphan_state, "simulated process loss", False)
     lock = TrackingLock()
 
-    async def finish(resumed_id, *, refresh):
+    async def finish(resumed_id, *, refresh, vacancy_cache_ttl):
         assert resumed_id == run_id
         local.repo.set_run_state(run_id, "completed", complete=True)
 
@@ -398,7 +452,7 @@ async def test_detail_loading_is_bounded_to_three_workers(tmp_path, monkeypatch)
         ]
     }
 
-    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None):
+    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None, _cache_ttl=None):
         nonlocal active, maximum
         active += 1
         maximum = max(maximum, active)
