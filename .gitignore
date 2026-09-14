@@ -209,6 +209,14 @@ tempCodeRunnerFile.py
 # PyPI configuration file
 .pypirc
 
+# HH MCP local runtime state
+work/
+*.db
+*.db-shm
+*.db-wal
+*.lock
+!uv.lock
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
