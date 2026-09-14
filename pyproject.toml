@@ -1,0 +1,65 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "hhmcp"
+version = "0.1.0"
+description = "Local CLI and MCP server for collecting and organizing public hh.ru vacancies"
+readme = "README.md"
+requires-python = ">=3.12"
+license = { text = "MIT" }
+authors = [
+  { name = "hhmcp contributors" },
+]
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Environment :: Console",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database :: Front-Ends",
+]
+dependencies = [
+  "mcp>=1.10,<2",
+  "playwright>=1.50,<2",
+  "pydantic>=2.10,<3",
+  "typer>=0.15,<1",
+  "filelock>=3.16,<4",
+]
+
+[project.optional-dependencies]
+dev = [
+  "mypy>=1.14,<2",
+  "pytest>=8.3,<9",
+  "pytest-asyncio>=0.25,<1",
+  "pytest-cov>=6,<8",
+  "ruff>=0.9,<1",
+]
+
+[project.scripts]
+hhmcp = "hhmcp.cli:app"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/hhmcp"]
+
+[tool.pytest.ini_options]
+addopts = "-ra --strict-config --strict-markers"
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM"]
+ignore = ["E501"]
+
+[tool.mypy]
+python_version = "3.12"
+packages = ["hhmcp"]
+check_untyped_defs = true
+disable_error_code = ["type-arg", "no-untyped-def", "no-untyped-call", "attr-defined", "assignment", "arg-type", "union-attr", "var-annotated"]
