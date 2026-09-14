@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlparse
 
 from .applications import draft_view
 from .auth import OAuthTokens, make_pkce_request
-from .config import load_settings, save_settings
+from .config import environment_access, load_settings, save_settings
 from .errors import HHMCPError
 from .runtime import Runtime
 from .security import ensure_private_directory
@@ -46,6 +46,11 @@ def _parser() -> argparse.ArgumentParser:
 
 
 def _configure(callback_url: str) -> None:
+    if environment_access() is not None:
+        raise HHMCPError(
+            "configuration",
+            "Unset HH_MCP_ACCESS_TOKEN and HH_MCP_USER_AGENT before configuring OAuth credentials",
+        )
     current = load_settings()
     user_agent = input("HH User-Agent (for example: MyHHMCP/0.1 contact@example.com): ").strip()
     client_id = input("HH application client ID: ").strip()
@@ -163,11 +168,21 @@ async def _login() -> None:
 
 def _doctor() -> None:
     runtime = Runtime()
-    marker = b"hh-mcp-aes-gcm-roundtrip"
-    encrypted = runtime.state.protector.protect(marker, entropy=b"doctor")
-    encryption_ok = runtime.state.protector.unprotect(encrypted, entropy=b"doctor") == marker
-    _json(
-        {
+    if runtime.mode == "environment_access_token":
+        result = {
+            "ok": True,
+            "python": sys.version.split()[0],
+            "mode": runtime.mode,
+            "auth": runtime.auth.status(),
+            "local_state_initialized": False,
+            "network_checked": False,
+        }
+    else:
+        assert runtime.state is not None
+        marker = b"hh-mcp-aes-gcm-roundtrip"
+        encrypted = runtime.state.protector.protect(marker, entropy=b"doctor")
+        encryption_ok = runtime.state.protector.unprotect(encrypted, entropy=b"doctor") == marker
+        result = {
             "ok": encryption_ok,
             "python": sys.version.split()[0],
             "home": str(runtime.settings.home),
@@ -177,20 +192,21 @@ def _doctor() -> None:
             "state": runtime.state.counts(),
             "network_checked": False,
         }
-    )
+    _json(result)
     asyncio.run(runtime.close())
 
 
 async def _application(command: str, draft_id: str) -> None:
     runtime = Runtime()
     try:
-        draft = runtime.state.get_draft(draft_id)
+        applications = await runtime.ready_applications()
+        draft = applications.state.get_draft(draft_id)
         view = draft_view(draft)
         if command == "show":
             _json(view)
             return
         if command == "status":
-            _json(await runtime.applications.status(draft_id))
+            _json(await applications.status(draft_id))
             return
         _json(view)
         print(
@@ -202,7 +218,7 @@ async def _application(command: str, draft_id: str) -> None:
         answer = input(f"Type exactly {phrase} to send: ")
         if answer != phrase:
             raise HHMCPError("cancelled", "Submission cancelled")
-        _json(await runtime.applications.submit_from_cli(draft_id))
+        _json(await applications.submit_from_cli(draft_id))
     finally:
         await runtime.close()
 

@@ -30,7 +30,8 @@
 
 - Windows 10/11, macOS или Linux;
 - Python 3.11 или новее;
-- зарегистрированное приложение HH;
+- зарегистрированное приложение HH для сохраняемого OAuth-режима либо действующий
+  пользовательский OAuth access token соискателя для env-режима;
 - `uv` (рекомендуется) либо другой установщик, способный установить `pyproject.toml`.
 
 В PowerShell из каталога проекта:
@@ -53,7 +54,7 @@ uv run pytest -p no:cacheprovider
 `${XDG_DATA_HOME:-~/.local/share}/hh-mcp` (Linux). Для изолированной проверки можно
 задать `HH_MCP_HOME` абсолютным путём в своей рабочей папке.
 
-Master key длиной 256 бит хранится одной версионированной записью системного credential
+В сохраняемом OAuth-режиме master key длиной 256 бит хранится одной версионированной записью системного credential
 service; файлы секретов и тексты черновиков шифруются AES-GCM со случайным nonce и
 контекстным AAD. На Windows используется Credential Locker, на macOS — Keychain, на
 Linux — Secret Service или KWallet. Null/Fail, plaintext, chained и неизвестные
@@ -62,7 +63,78 @@ D-Bus и разблокированный системный keyring (напри
 `keyrings.alt` устанавливать не следует. Если `keyring` выбрал Chainer, явно выберите
 один системный backend через `PYTHON_KEYRING_BACKEND` и повторите `doctor`.
 
-## Регистрация и подключение HH
+## Быстрый env-token режим
+
+Для запуска `serve` без `configure`, keyring и браузерного OAuth задайте две переменные:
+
+- `HH_MCP_ACCESS_TOKEN` — действующий **пользовательский OAuth access token
+  соискателя**, не application token;
+- `HH_MCP_USER_AGENT` — реальный User-Agent с контактным email, например
+  `MyHHMCP/0.1 (me@example.com)`.
+
+Если задана только одна переменная, пустое значение или User-Agent без email, сервер
+завершается с понятной ошибкой. При наличии обеих переменных env-режим имеет приоритет
+над сохранённой конфигурацией. Все read-запросы, включая поиск, справочники, резюме и
+историю, используют этот bearer. Keyring, `config.json`, SQLite и auth state для чтения
+не инициализируются. Refresh отсутствует: при HTTP 401 замените token в MCP-конфигурации
+и перезапустите сервер.
+
+`hh_prepare_application` сначала лениво вызывает `/me`, требует `applicant` и получает
+`account_id`. Только после этого создаётся защищённый каталог и отдельный
+`environment-state.db`. Письма шифруются AES-256-GCM ключом, полученным через HKDF-SHA256
+из access token и account ID. Сам token не записывается в базу. Смена token меняет ключ,
+поэтому старые env-черновики становятся недоступны; готовьте их заново. HKDF не защищает
+от лица, уже прочитавшего token: имея token и базу, оно может получить тот же ключ.
+
+MCP-конфигурация обычно хранит значения `env` открытым текстом. Это значит, что token
+лежит в файле конфигурации как секрет. Если клиент умеет подставлять secret variables
+из системного хранилища, используйте эту функцию вместо literal token.
+
+Windows:
+
+```json
+{
+  "command": "C:\\path\\to\\hh-mcp\\.venv\\Scripts\\python.exe",
+  "args": ["-m", "hh_mcp", "serve"],
+  "cwd": "C:\\path\\to\\hh-mcp",
+  "env": {
+    "HH_MCP_ACCESS_TOKEN": "PASTE_APPLICANT_OAUTH_ACCESS_TOKEN_HERE",
+    "HH_MCP_USER_AGENT": "MyHHMCP/0.1 (me@example.com)"
+  }
+}
+```
+
+macOS:
+
+```json
+{
+  "command": "/Users/YOU/path/hh-mcp/.venv/bin/python",
+  "args": ["-m", "hh_mcp", "serve"],
+  "cwd": "/Users/YOU/path/hh-mcp",
+  "env": {
+    "HH_MCP_ACCESS_TOKEN": "PASTE_APPLICANT_OAUTH_ACCESS_TOKEN_HERE",
+    "HH_MCP_USER_AGENT": "MyHHMCP/0.1 (me@example.com)"
+  }
+}
+```
+
+Linux:
+
+```json
+{
+  "command": "/home/YOU/path/hh-mcp/.venv/bin/python",
+  "args": ["-m", "hh_mcp", "serve"],
+  "cwd": "/home/YOU/path/hh-mcp",
+  "env": {
+    "HH_MCP_ACCESS_TOKEN": "PASTE_APPLICANT_OAUTH_ACCESS_TOKEN_HERE",
+    "HH_MCP_USER_AGENT": "MyHHMCP/0.1 (me@example.com)"
+  }
+}
+```
+
+## Сохраняемый OAuth-режим: регистрация и подключение HH
+
+Перед этими командами удалите из окружения обе переменные env-token режима.
 
 1. Войдите на [dev.hh.ru](https://dev.hh.ru) и создайте приложение. Укажите понятное
    название, что приложение локально помогает соискателю искать вакансии и готовить
@@ -128,7 +200,7 @@ uv run hh-mcp auth logout
 уже существует, сохраните его как резервную копию, выберите новый `HH_MCP_HOME` и
 повторите `configure`; старые токены потребуется получить новым входом.
 
-## Подключение к Codex
+## Подключение сохраняемого OAuth-режима к Codex
 
 Сначала выполните `configure`, `doctor` и `auth login` вручную. Затем добавьте сервер
 через интерфейс Codex, используя абсолютные пути. Эти образцы не изменяют реальную
@@ -173,7 +245,7 @@ Linux:
 }
 ```
 
-В `env` нет client secret и токенов. Для другого MCP-клиента используйте тот же
+В этих трёх примерах сохраняемого режима в `env` нет client secret и токенов. Для другого MCP-клиента используйте тот же
 `command`, `args`, `cwd` и локальный транспорт `stdio`.
 
 ## Инструменты MCP

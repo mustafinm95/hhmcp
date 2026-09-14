@@ -3,11 +3,18 @@ from __future__ import annotations
 import json
 import os
 import sys
+from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 
 from .errors import ConfigurationError
+
+
+@dataclass(frozen=True, slots=True)
+class EnvironmentAccess:
+    token: str
+    user_agent: str
 
 
 @dataclass(frozen=True, slots=True)
@@ -27,6 +34,10 @@ class Settings:
         return self.home / "state.db"
 
     @property
+    def environment_state_db(self) -> Path:
+        return self.home / "environment-state.db"
+
+    @property
     def auth_lock(self) -> Path:
         return self.home / "auth.lock"
 
@@ -35,10 +46,13 @@ class Settings:
         return self.home / "secrets"
 
     def validate(self) -> None:
-        if not self.user_agent or "@" not in self.user_agent:
-            raise ConfigurationError(
-                "Set a descriptive HH User-Agent containing a contact email with `hh-mcp configure`."
-            )
+        if (
+            not self.user_agent.strip()
+            or "@" not in self.user_agent
+            or "\r" in self.user_agent
+            or "\n" in self.user_agent
+        ):
+            raise ConfigurationError("HH User-Agent must contain a contact email and no line breaks")
         for name, value, expected_host in (
             ("api_base_url", self.api_base_url, "api.hh.ru"),
             ("token_url", self.token_url, "api.hh.ru"),
@@ -67,7 +81,7 @@ def _absolute_without_resolving(path: Path) -> Path:
 
 def default_home(
     *, platform_name: str | None = None,
-    environ: dict[str, str] | None = None,
+    environ: Mapping[str, str] | None = None,
     user_home: Path | None = None,
 ) -> Path:
     platform_name = platform_name or sys.platform
@@ -92,6 +106,25 @@ def default_home(
             return _absolute_without_resolving(xdg_path / "hh-mcp")
         return _absolute_without_resolving(home / ".local" / "share" / "hh-mcp")
     raise ConfigurationError(f"Unsupported platform: {platform_name}")
+
+
+def environment_access(environ: Mapping[str, str] | None = None) -> EnvironmentAccess | None:
+    environment = os.environ if environ is None else environ
+    token_present = "HH_MCP_ACCESS_TOKEN" in environment
+    user_agent_present = "HH_MCP_USER_AGENT" in environment
+    if not token_present and not user_agent_present:
+        return None
+    if not token_present or not user_agent_present:
+        raise ConfigurationError(
+            "HH_MCP_ACCESS_TOKEN and HH_MCP_USER_AGENT must be set together for environment access mode"
+        )
+    token = environment["HH_MCP_ACCESS_TOKEN"]
+    if not token or token != token.strip() or "\r" in token or "\n" in token:
+        raise ConfigurationError("HH_MCP_ACCESS_TOKEN must be a non-empty value without surrounding whitespace")
+    user_agent = environment["HH_MCP_USER_AGENT"]
+    if not user_agent.strip() or "@" not in user_agent or "\r" in user_agent or "\n" in user_agent:
+        raise ConfigurationError("HH_MCP_USER_AGENT must contain a contact email and no line breaks")
+    return EnvironmentAccess(token=token, user_agent=user_agent)
 
 
 def load_settings(home: Path | None = None) -> Settings:

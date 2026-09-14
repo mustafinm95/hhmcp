@@ -10,6 +10,7 @@ from hh_mcp.secrets import (
     EncryptedFileSecretStore,
     KeyringCredentialBackend,
     MasterKeyProvider,
+    derive_environment_draft_key,
     master_key_account,
     validate_credential_backend,
 )
@@ -149,6 +150,13 @@ def test_aes_gcm_round_trip_entropy_and_tamper() -> None:
     tampered = encrypted[:-1] + bytes([encrypted[-1] ^ 1])
     with pytest.raises(ConfigurationError):
         protector.unprotect(tampered, entropy=b"test-a")
+
+
+def test_environment_draft_key_is_deterministic_and_token_bound() -> None:
+    first = derive_environment_draft_key("token-a", "account")
+    assert first == derive_environment_draft_key("token-a", "account")
+    assert first != derive_environment_draft_key("token-b", "account")
+    assert first != derive_environment_draft_key("token-a", "other-account")
 
 
 def test_encrypted_file_store_never_writes_plaintext(workspace_tmp) -> None:

@@ -32,3 +32,8 @@ OAuth. MCP v2 предоставляет elicitation/Resolve, однако ко�
 используются на Windows, macOS и Linux. Локальные секреты защищены AES-256-GCM, а master
 key хранится в системном credential service; неподдерживаемый или небезопасный backend
 останавливает Runtime до чтения личных методов.
+
+Альтернативный env-token режим использует один переданный пользователем applicant OAuth
+access token для всех read-endpoint'ов. Перед созданием черновика `GET /me` подтверждает
+роль `applicant` и `account_id`; это не добавляет новый HH-контракт. Env-режим не делает
+refresh и интерпретирует `401` как необходимость заменить `HH_MCP_ACCESS_TOKEN`.

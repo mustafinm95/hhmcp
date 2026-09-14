@@ -21,8 +21,15 @@ MAX_RETRY_AFTER_SECONDS = 5.0
 
 
 class HHClient:
-    def __init__(self, settings: Settings, transport: httpx.AsyncBaseTransport | None = None) -> None:
+    def __init__(
+        self,
+        settings: Settings,
+        transport: httpx.AsyncBaseTransport | None = None,
+        *,
+        environment_access: bool = False,
+    ) -> None:
         self.settings = settings
+        self.environment_access = environment_access
         self._client = httpx.AsyncClient(
             base_url=settings.api_base_url,
             timeout=settings.request_timeout_seconds,
@@ -87,7 +94,7 @@ class HHClient:
         if 300 <= response.status_code < 400:
             return response, payload
         if response.is_error:
-            raise _http_error(response, payload)
+            raise _http_error(response, payload, environment_access=self.environment_access)
         return response, payload
 
     async def _bounded_request(self, method: str, path: str, **kwargs: Any) -> httpx.Response:
@@ -142,7 +149,9 @@ class HHClient:
         _, payload = await self.request("GET", f"/employers/{_identifier(employer_id)}", token=token)
         return _object(payload)
 
-    async def get_reference(self, name: str, identifier: str | None = None) -> Any:
+    async def get_reference(
+        self, name: str, identifier: str | None = None, token: str | None = None
+    ) -> Any:
         paths = {
             "areas": "/areas" if identifier is None else f"/areas/{_identifier(identifier)}",
             "professional_roles": "/professional_roles",
@@ -152,7 +161,7 @@ class HHClient:
         }
         if name not in paths:
             raise ValidationError("Unknown reference", details={"allowed": sorted(paths)})
-        _, payload = await self.request("GET", paths[name])
+        _, payload = await self.request("GET", paths[name], token=token)
         return payload
 
     async def list_my_resumes(self, token: str, page: int, per_page: int) -> dict[str, object]:
@@ -248,7 +257,9 @@ def _retry_delay(response: httpx.Response, attempt: int) -> float | None:
     return 0.2 * (2**attempt)
 
 
-def _http_error(response: httpx.Response, payload: Any) -> HHMCPError:
+def _http_error(
+    response: httpx.Response, payload: Any, *, environment_access: bool = False
+) -> HHMCPError:
     status = response.status_code
     safe_details: dict[str, Any] = {}
     if isinstance(payload, dict):
@@ -265,6 +276,13 @@ def _http_error(response: httpx.Response, payload: Any) -> HHMCPError:
         if error_types:
             safe_details["error_types"] = error_types[:10]
     serialized = json.dumps(safe_details).lower()
+    if status == 401 and environment_access:
+        return HHMCPError(
+            "environment_access_token_rejected",
+            "HH rejected HH_MCP_ACCESS_TOKEN; replace it with a current applicant OAuth access token",
+            status,
+            safe_details or None,
+        )
     if status == 401:
         kind = "authentication_required"
     elif status == 403 and "captcha" in serialized:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import base64
 import hashlib
 import secrets
@@ -65,12 +66,81 @@ class OAuthTokens:
 
 
 RefreshCall = Callable[[str], Awaitable[dict[str, object]]]
+IdentityCall = Callable[[str], Awaitable[dict[str, object]]]
 
 
 @dataclass(frozen=True, slots=True)
 class BoundUser:
     token: str
     identity: AuthSnapshot
+
+
+class EnvironmentAuth:
+    """Immutable access-token auth with lazy applicant identity discovery."""
+
+    def __init__(self, token: str, identity_call: IdentityCall) -> None:
+        self._token = token
+        self._identity_call = identity_call
+        self._identity: AuthSnapshot | None = None
+        self._identity_lock = asyncio.Lock()
+
+    def status(self) -> dict[str, object]:
+        return {
+            "mode": "environment_access_token",
+            "logged_in": True,
+            "account_id": self._identity.account_id if self._identity else None,
+            "identity_checked": self._identity is not None,
+            "refresh_supported": False,
+            "application_configured": False,
+        }
+
+    async def ensure_identity(self) -> AuthSnapshot:
+        if self._identity is not None:
+            return self._identity
+        async with self._identity_lock:
+            if self._identity is not None:
+                return self._identity
+            me = await self._identity_call(self._token)
+            if me.get("is_applicant") is not True or me.get("auth_type") != "applicant":
+                raise AuthenticationError("HH_MCP_ACCESS_TOKEN must belong to an applicant account")
+            raw_account_id = me.get("id")
+            account_id = str(raw_account_id) if raw_account_id is not None else ""
+            if not account_id:
+                raise AuthenticationError("HH /me response did not identify the applicant account")
+            self._identity = AuthSnapshot(
+                generation=1,
+                credential_revision=0,
+                account_id=account_id,
+                logged_in=True,
+                refresh_inflight=False,
+            )
+            return self._identity
+
+    async def user_access_token(self, refresh_call: RefreshCall) -> str:
+        return self._token
+
+    async def user_session(self, refresh_call: RefreshCall) -> BoundUser:
+        return BoundUser(self._token, await self.ensure_identity())
+
+    @asynccontextmanager
+    async def bound_user(self, refresh_call: RefreshCall):
+        yield BoundUser(self._token, await self.ensure_identity())
+
+    def application_access_token(self) -> str:
+        return self._token
+
+    async def get_application_token(
+        self, token_call: Callable[[str, str], Awaitable[dict[str, object]]]
+    ) -> str:
+        return self._token
+
+    def application_credentials(self) -> tuple[str, str]:
+        raise ConfigurationError(
+            "OAuth login is unavailable while HH_MCP_ACCESS_TOKEN is set; unset it to use configured OAuth"
+        )
+
+    def logout(self) -> int:
+        raise ConfigurationError("Unset HH_MCP_ACCESS_TOKEN to end environment access-token mode")
 
 
 class AuthManager:

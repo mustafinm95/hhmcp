@@ -90,7 +90,7 @@ class HHService:
 
     async def get_reference(self, name: str, query: str | None, limit: int) -> dict[str, object]:
         limit = _bounded_int(limit, "limit", 1, 500)
-        value = await self.client.get_reference(name)
+        value = await self.client.get_reference(name, token=await self.public_token())
         if not query:
             data, truncated = _limit_reference(value, limit)
             return {"name": name, "data": data, "limit": limit, "truncated": truncated}

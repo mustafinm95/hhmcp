@@ -4,7 +4,7 @@
 
 ## Выполнено локально
 
-- 66 pytest-сценариев; HTTP mocks покрывают поиск, пагинацию, повторяемые query-параметры,
+- 78 pytest-сценариев; HTTP mocks покрывают поиск, пагинацию, повторяемые query-параметры,
   отсутствие follow redirect, ограниченный размер ответа, безопасные ошибки, multipart;
 - SQLite: два разных черновика одной цели, разные аккаунты, subprocess-конкуренция,
   `unknown`, `sent`, истечение и повторное открытие базы после перезапуска;
@@ -25,11 +25,15 @@
 - платформенные пути данных, сохранение symlink для последующего отказа, ветвление
   Windows/POSIX и проверка неверного владельца; POSIX mode/UID integration запускается
   только на POSIX;
+- env-token mode: обязательная пара token/User-Agent, приоритет над файлом, отсутствие
+  config/keyring/SQLite на read-пути, bearer для поиска/справочников/личных endpoint'ов,
+  понятный `401` без утечки token, applicant binding через `/me` до создания state и
+  HKDF/AES-GCM-шифрование письма;
 - импорт, compileall и запуск полного набора на Windows без Windows-only импортов;
 - `ruff check`, `uv lock --check`, чистая установка 47 пакетов из `uv.lock`, wheel
   `hh_mcp-0.1.0-py3-none-any.whl` и sdist `hh_mcp-0.1.0.tar.gz`.
 
-Финальный результат на Windows / CPython 3.13.7: `66 passed, 2 skipped`. Пропущены
+Финальный результат на Windows / CPython 3.13.7: `78 passed, 2 skipped`. Пропущены
 POSIX integration и symlink integration, поскольку текущий Windows sandbox не разрешил
 создать symlink. Команда тестов в обычной среде:
 
@@ -51,6 +55,7 @@ uv run pytest -p no:cacheprovider
 
 - регистрация приложения и принятие `http://127.0.0.1:8765/callback` кабинетом HH;
 - живой OAuth, поиск, чтение собственных резюме и истории;
+- живой applicant access token в env-режиме и фактическое истечение/замена token;
 - актуальность исторического `POST /negotiations` для конкретного приложения;
 - реальная отправка отклика (не разрешалась и MCP submit выключен).
 

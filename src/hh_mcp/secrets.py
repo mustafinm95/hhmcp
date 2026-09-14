@@ -11,7 +11,9 @@ from pathlib import Path
 from typing import Protocol
 
 from cryptography.exceptions import InvalidTag
+from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
 from .errors import ConfigurationError
 
@@ -46,6 +48,16 @@ def master_key_account(home: Path) -> str:
     canonical = os.path.normcase(os.path.abspath(os.fspath(home)))
     digest = hashlib.sha256(os.fsencode(canonical)).hexdigest()[:32]
     return f"installation-{digest}"
+
+
+def derive_environment_draft_key(token: str, account_id: str) -> bytes:
+    """Derive a state-only key; changing the access token intentionally changes the key."""
+    return HKDF(
+        algorithm=hashes.SHA256(),
+        length=32,
+        salt=b"hh-mcp/environment-draft/salt/v1",
+        info=b"hh-mcp/environment-draft/key/v1\x00" + account_id.encode("utf-8"),
+    ).derive(token.encode("utf-8"))
 
 
 def validate_credential_backend(backend: CredentialBackend, *, platform_name: str | None = None) -> str:

@@ -53,6 +53,8 @@ def test_stdio_initialization_and_tools_list(workspace_tmp: Path) -> None:
     environment = os.environ.copy()
     environment["PYTHONPATH"] = str(project / "src")
     environment["HH_MCP_HOME"] = str(workspace_tmp)
+    environment["HH_MCP_ACCESS_TOKEN"] = "stdio-secret-token"
+    environment["HH_MCP_USER_AGENT"] = "HHMCPTests/0.1 tests@example.com"
     process = subprocess.Popen(
         [sys.executable, "-m", "hh_mcp", "serve"],
         cwd=project, env=environment, text=True, encoding="utf-8", bufsize=1,
@@ -90,6 +92,23 @@ def test_stdio_initialization_and_tools_list(workspace_tmp: Path) -> None:
         rejected = json.loads(process.stdout.readline())
         assert rejected["result"]["isError"] is True
         assert "extra_forbidden" in rejected["result"]["content"][0]["text"]
+        process.stdin.write(
+            json.dumps(
+                {
+                    "jsonrpc": "2.0", "id": 4, "method": "tools/call",
+                    "params": {"name": "hh_auth_status", "arguments": {}},
+                }
+            )
+            + "\n"
+        )
+        process.stdin.flush()
+        status = json.loads(process.stdout.readline())
+        serialized = json.dumps(status)
+        assert status["result"]["structuredContent"]["mode"] == "environment_access_token"
+        assert "stdio-secret-token" not in serialized
+        assert not (workspace_tmp / "config.json").exists()
+        assert not (workspace_tmp / "state.db").exists()
+        assert not (workspace_tmp / "environment-state.db").exists()
     finally:
         process.terminate()
         process.wait(timeout=5)
