@@ -5,8 +5,11 @@ from __future__ import annotations
 import asyncio
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import suppress
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, cast
+from urllib.parse import parse_qs, urlparse
 
 from .parsing import SearchPage, parse_search_page, validate_search_url
 
@@ -17,6 +20,40 @@ class BrowserBlocked(RuntimeError):
 
 class PageNotReady(RuntimeError):
     """The page did not reach an explicit, parseable state."""
+
+
+class NavigationLimiter:
+    """Space navigation starts globally and back off all workers together."""
+
+    def __init__(self, interval: float = 1.0) -> None:
+        self.interval = interval
+        self._next_start = 0.0
+        self._lock = asyncio.Lock()
+
+    async def wait(self) -> None:
+        async with self._lock:
+            await asyncio.sleep(max(0.0, self._next_start - time.monotonic()))
+            self._next_start = time.monotonic() + self.interval
+
+    async def backoff(self, seconds: float) -> None:
+        async with self._lock:
+            self._next_start = max(self._next_start, time.monotonic() + seconds)
+
+
+def retained_search_filters(request_url: str, final_url: str) -> tuple[dict[str, list[str]], list[str]]:
+    ignored = {"page", "search_session_id", "hhtmFrom"}
+    requested = {
+        key: values
+        for key, values in parse_qs(urlparse(request_url).query).items()
+        if key not in ignored
+    }
+    final_parameters = parse_qs(urlparse(final_url).query)
+    retained = {
+        key: values
+        for key, values in requested.items()
+        if sorted(final_parameters.get(key, [])) == sorted(values)
+    }
+    return retained, sorted(set(requested) - set(retained))
 
 
 async def wait_for_stable_nonzero_count(
@@ -52,9 +89,10 @@ class BrowserAdapter:
         retries: int = 3,
         timeout_ms: int = 30_000,
         profile_dir: str | Path | None = None,
+        _limiter: NavigationLimiter | None = None,
     ) -> None:
-        if min_delay < 2:
-            raise ValueError("min_delay must be at least 2 seconds")
+        if min_delay < 1:
+            raise ValueError("min_delay must be at least 1 second")
         self.headless = headless
         self.min_delay = min_delay
         self.retries = retries
@@ -62,7 +100,10 @@ class BrowserAdapter:
         self.profile_dir = Path(profile_dir or Path.home() / ".hhmcp" / "browser-profile")
         self._playwright = self._page = None
         self._context = None
-        self._last_navigation = 0.0
+        self._limiter = _limiter or NavigationLimiter(min_delay)
+        self.last_status: int | None = None
+        self.last_availability: str | None = None
+        self.last_visible_fields: dict | None = None
 
     async def __aenter__(self):
         try:
@@ -109,7 +150,27 @@ class BrowserAdapter:
             raise
 
     async def _pace(self) -> None:
-        await asyncio.sleep(max(0.0, self.min_delay - (time.monotonic() - self._last_navigation)))
+        await self._limiter.wait()
+
+    async def new_page_adapter(self) -> BrowserAdapter:
+        if self._context is None:
+            raise RuntimeError("BrowserAdapter must be used as an async context manager")
+        child = BrowserAdapter(
+            headless=self.headless,
+            min_delay=self.min_delay,
+            retries=self.retries,
+            timeout_ms=self.timeout_ms,
+            profile_dir=self.profile_dir,
+            _limiter=self._limiter,
+        )
+        child._context = self._context
+        child._page = await self._context.new_page()
+        return child
+
+    async def close_page(self) -> None:
+        if self._page is not None:
+            await self._page.close()
+            self._page = None
 
     async def fetch_html(self, url: str, *, readiness: str = "generic") -> tuple[str, str]:
         if self._page is None:
@@ -118,11 +179,31 @@ class BrowserAdapter:
         for attempt in range(self.retries):
             await self._pace()
             try:
-                self._last_navigation = time.monotonic()
-                await self._page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
+                response = await self._page.goto(
+                    url, wait_until="domcontentloaded", timeout=self.timeout_ms
+                )
+                self.last_status = response.status if response else None
+                if self.last_status in {429, 503}:
+                    headers = await response.all_headers() if response else {}
+                    retry_after = headers.get("retry-after")
+                    delay = float(2**attempt)
+                    if retry_after:
+                        try:
+                            delay = float(retry_after)
+                        except ValueError:
+                            with suppress(TypeError, ValueError):
+                                delay = max(
+                                    0.0,
+                                    parsedate_to_datetime(retry_after).timestamp() - time.time(),
+                                )
+                    await self._limiter.backoff(min(max(delay, 1.0), 30.0))
+                    raise PageNotReady(f"HH returned HTTP {self.last_status}")
                 await self._raise_if_blocked()
-                await self._wait_ready(readiness)
+                if self.last_status not in {404, 410}:
+                    await self._wait_ready(readiness)
                 await self._raise_if_blocked()
+                self.last_availability = await self._visible_availability(readiness)
+                self.last_visible_fields = await self._visible_vacancy_fields(readiness)
                 return await self._page.content(), self._page.url
             except BrowserBlocked:
                 if self.headless:
@@ -148,7 +229,6 @@ class BrowserAdapter:
         if self._page is None:
             raise RuntimeError("BrowserAdapter must be used as an async context manager")
         await self._pace()
-        self._last_navigation = time.monotonic()
         await self._page.goto(
             "https://hh.ru/search/vacancy",
             wait_until="domcontentloaded",
@@ -236,6 +316,61 @@ class BrowserAdapter:
             or any(phrase in body[:5000] for phrase in exact_phrases)
         )
 
+    async def _visible_availability(self, readiness: str) -> str | None:
+        if readiness != "vacancy" or self._page is None:
+            return None
+        if self.last_status in {404, 410}:
+            return "unavailable"
+        archived = self._page.locator(
+            '[data-qa*="vacancy-archive"]:visible, [data-qa="vacancy-archived"]:visible'
+        )
+        if await archived.count():
+            return "archived"
+        unavailable = self._page.locator(
+            '[data-qa="vacancy-unavailable"]:visible, [data-qa="vacancy-not-found"]:visible'
+        )
+        if await unavailable.count():
+            return "unavailable"
+        title = self._page.locator(
+            '[data-qa="vacancy-title"]:visible, [data-qa="vacancy-title-text"]:visible'
+        )
+        description = self._page.locator('[data-qa="vacancy-description"]:visible')
+        if await title.count() and await description.count():
+            return "active"
+        return "unknown"
+
+    async def _visible_vacancy_fields(self, readiness: str) -> dict | None:
+        if readiness != "vacancy" or self._page is None or self.last_status in {404, 410}:
+            return None
+        qas = {
+            "experience": ("vacancy-experience", "vacancy-view-experience"),
+            "employment": ("vacancy-employment", "vacancy-view-employment-mode"),
+            "schedule": ("vacancy-schedule", "vacancy-work-schedule-by-days"),
+            "hours": ("vacancy-working-hours", "working-hours", "vacancy-working-hours-text"),
+            "work_format": ("vacancy-work-format", "work-format", "vacancy-work-format-text"),
+        }
+        conditions = {}
+        for name, values in qas.items():
+            selector = ", ".join(f'[data-qa="{value}"]:visible' for value in values)
+            locator = self._page.locator(selector)
+            if await locator.count():
+                value = (await locator.first.inner_text()).strip()
+                if value:
+                    conditions[name] = value
+        publication = self._page.locator(
+            '[data-qa="vacancy-creation-time"]:visible, '
+            '[data-qa="vacancy-creation-time-redesigned"]:visible, '
+            '[data-qa="vacancy-view-creation-time"]:visible'
+        )
+        result: dict[str, Any] = {"conditions": conditions}
+        if await publication.count():
+            node = publication.first
+            result["published_text"] = (await node.inner_text()).strip()
+            result["published_at"] = await node.get_attribute("datetime") or await node.get_attribute(
+                "content"
+            )
+        return result
+
     async def _wait_ready(self, readiness: str) -> None:
         assert self._page is not None
         selectors = {
@@ -265,19 +400,25 @@ class BrowserAdapter:
             return
         if readiness == "vacancy":
             terminal = self._page.locator(
-                '[data-qa*="vacancy-archive"], [data-qa="vacancy-unavailable"]'
+                '[data-qa*="vacancy-archive"]:visible, '
+                '[data-qa="vacancy-unavailable"]:visible, '
+                '[data-qa="vacancy-not-found"]:visible'
             )
             vacancy_outcome = self._page.locator(
-                selectors["vacancy"]
-                + ', [data-qa*="vacancy-archive"], [data-qa="vacancy-unavailable"]'
+                '[data-qa="vacancy-title"]:visible, '
+                '[data-qa="vacancy-title-text"]:visible, '
+                '[data-qa*="vacancy-archive"]:visible, '
+                '[data-qa="vacancy-unavailable"]:visible, '
+                '[data-qa="vacancy-not-found"]:visible'
             )
-            await vacancy_outcome.first.wait_for(state="attached", timeout=self.timeout_ms)
+            await vacancy_outcome.first.wait_for(state="visible", timeout=self.timeout_ms)
             if await terminal.count():
                 return
             details = self._page.locator(
-                '[data-qa="vacancy-description"], [data-qa="vacancy-company-name"]'
+                '[data-qa="vacancy-description"]:visible, '
+                '[data-qa="vacancy-company-name"]:visible'
             )
-            await details.first.wait_for(state="attached", timeout=self.timeout_ms)
+            await details.first.wait_for(state="visible", timeout=self.timeout_ms)
             return
         await self._page.locator(selectors.get(readiness, "body")).first.wait_for(
             state="attached", timeout=self.timeout_ms
@@ -287,6 +428,7 @@ class BrowserAdapter:
         self, url: str, *, max_pages: int | None = None
     ) -> AsyncIterator[tuple[SearchPage, str]]:
         next_url = validate_search_url(url)
+        request_url = next_url
         seen_urls: set[str] = set()
         seen_signatures: set[tuple[str, ...]] = set()
         page_number = 0
@@ -296,6 +438,9 @@ class BrowserAdapter:
             seen_urls.add(next_url)
             source, final_url = await self.fetch_html(next_url, readiness="search")
             parsed = parse_search_page(source, final_url)
+            retained, missing = retained_search_filters(request_url, final_url)
+            parsed.applied_filters.update(retained)
+            parsed.unchecked_parameters = missing
             signature = tuple(sorted(item.hh_id for item in parsed.items))
             if signature and signature in seen_signatures:
                 raise PageNotReady("search page repeated the same vacancy set")
@@ -312,7 +457,6 @@ class BrowserAdapter:
         if self._page is None:
             raise RuntimeError("BrowserAdapter must be used as an async context manager")
         await self._pace()
-        self._last_navigation = time.monotonic()
         await self._page.goto(url, wait_until="domcontentloaded", timeout=self.timeout_ms)
         deadline = time.monotonic() + challenge_timeout
         while await self._is_blocked():

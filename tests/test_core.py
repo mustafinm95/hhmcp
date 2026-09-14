@@ -1,6 +1,7 @@
 import asyncio
 import csv
 import multiprocessing
+import sqlite3
 import time
 from pathlib import Path
 
@@ -12,7 +13,7 @@ from hhmcp.lock import CollectorBusy, CollectorLock
 from hhmcp.models import CandidateProfile, Criterion, FieldState, Salary, SearchSpec, Vacancy
 from hhmcp.ranking import rank
 from hhmcp.repository import Repository
-from hhmcp.service import Collector
+from hhmcp.service import Collector, search_url
 
 
 def vacancy(vid: str = "1", title: str = "Python") -> Vacancy:
@@ -31,6 +32,13 @@ def test_search_spec_sources_are_exclusive():
     with pytest.raises(ValueError):
         SearchSpec(url="https://hh.ru/search/vacancy", text="python")
     assert SearchSpec(text="python").text == "python"
+
+
+def test_structured_search_url_supports_moscow_and_multiple_values():
+    url = search_url(
+        SearchSpec(text="HR Lead", area=["1", "2"], employment=["full"])
+    )
+    assert "area=1" in url and "area=2" in url and "employment=full" in url
 
 
 def test_versions_a_b_a_and_local_fields_survive(tmp_path):
@@ -139,6 +147,30 @@ def test_newer_database_is_rejected(tmp_path):
         con.execute("UPDATE meta SET value='999' WHERE key='schema_version'")
     with pytest.raises(RuntimeError):
         Database(tmp_path / "db.sqlite")
+
+
+def test_version_one_database_is_migrated_with_progress(tmp_path):
+    path = tmp_path / "old.sqlite"
+    with sqlite3.connect(path) as con:
+        con.executescript(
+            """
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES('schema_version', '1');
+            CREATE TABLE runs(
+              id TEXT PRIMARY KEY, state TEXT NOT NULL, created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL, stop_reason TEXT, complete INTEGER NOT NULL DEFAULT 0,
+              limit_count INTEGER NOT NULL, discovered INTEGER NOT NULL DEFAULT 0,
+              accepted INTEGER NOT NULL DEFAULT 0, loaded INTEGER NOT NULL DEFAULT 0,
+              cached INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+    db = Database(path)
+    with db.connect() as con:
+        columns = {row[1] for row in con.execute("PRAGMA table_info(runs)")}
+        version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+    assert "progress_json" in columns
+    assert version == "2"
 
 
 def test_csv_formula_protection_and_unicode(tmp_path):

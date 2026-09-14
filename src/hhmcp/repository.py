@@ -9,7 +9,7 @@ from datetime import UTC, datetime
 from typing import Any
 
 from .db import Database, utcnow
-from .models import CandidateProfile, Employer, Run, RunState, SearchSpec, Vacancy
+from .models import CandidateProfile, Employer, Run, RunProgress, RunState, SearchSpec, Vacancy
 
 LOCAL_STATUSES = {"новое", "интересно", "откликнулся", "интервью", "предложение", "отказ", "скрыто"}
 MEANINGFUL = {
@@ -26,6 +26,8 @@ MEANINGFUL = {
     "department_name",
     "contacts",
     "archived",
+    "unavailable",
+    "availability",
 }
 
 
@@ -102,7 +104,15 @@ class Repository:
             cached=row["cached"],
             errors=row["errors"],
             search_specs=specs,
+            progress=RunProgress.model_validate_json(row["progress_json"] or "{}"),
         )
+
+    def set_progress(self, run_id: str, progress: RunProgress) -> None:
+        with self.db.transaction() as con:
+            con.execute(
+                "UPDATE runs SET progress_json=?,updated_at=? WHERE id=?",
+                (progress.model_dump_json(), utcnow(), run_id),
+            )
 
     def set_run_state(
         self,
@@ -157,10 +167,11 @@ class Repository:
                 "SELECT 1 FROM run_vacancies WHERE run_id=? AND vacancy_id=?",
                 (run_id, vacancy_id),
             ).fetchone()
-            accepted = con.execute(
-                "SELECT COUNT(DISTINCT vacancy_id) FROM run_vacancies WHERE run_id=? AND accepted=1",
-                (run_id,),
-            ).fetchone()[0]
+            globally_discovered = con.execute(
+                "SELECT 1 FROM run_vacancies WHERE run_id=? AND vacancy_id=?",
+                (run_id, vacancy_id),
+            ).fetchone()
+            accepted = con.execute("SELECT accepted FROM runs WHERE id=?", (run_id,)).fetchone()[0]
             globally_accepted = con.execute(
                 "SELECT 1 FROM run_vacancies WHERE run_id=? AND vacancy_id=? AND accepted=1",
                 (run_id, vacancy_id),
@@ -175,6 +186,10 @@ class Repository:
             )
             if take:
                 con.execute(
+                    "UPDATE run_vacancies SET accepted=1 WHERE run_id=? AND vacancy_id=?",
+                    (run_id, vacancy_id),
+                )
+                con.execute(
                     """INSERT OR IGNORE INTO jobs(run_id,kind,target,payload_json)
                        VALUES(?,?,?,?)""",
                     (
@@ -184,38 +199,12 @@ class Repository:
                         canonical({"url": url, "observed": observed or {}}),
                     ),
                 )
-            self._sync_counts(con, run_id)
+            con.execute(
+                """UPDATE runs SET discovered=discovered+?,accepted=accepted+?,updated_at=?
+                   WHERE id=?""",
+                (int(not globally_discovered), int(take), utcnow(), run_id),
+            )
             return not bool(existed), take, rejected_by_limit
-
-    @staticmethod
-    def _sync_counts(con: sqlite3.Connection, run_id: str) -> None:
-        discovered = con.execute(
-            "SELECT COUNT(DISTINCT vacancy_id) FROM run_vacancies WHERE run_id=?", (run_id,)
-        ).fetchone()[0]
-        accepted = con.execute(
-            "SELECT COUNT(DISTINCT vacancy_id) FROM run_vacancies WHERE run_id=? AND accepted=1",
-            (run_id,),
-        ).fetchone()[0]
-        values = {state: 0 for state in ("loaded", "cached", "error")}
-        for row in con.execute(
-            "SELECT state,COUNT(*) n FROM jobs WHERE run_id=? AND kind='vacancy' GROUP BY state",
-            (run_id,),
-        ):
-            if row["state"] in values:
-                values[row["state"]] = row["n"]
-        con.execute(
-            """UPDATE runs SET discovered=?,accepted=?,loaded=?,cached=?,errors=?,updated_at=?
-               WHERE id=?""",
-            (
-                discovered,
-                accepted,
-                values["loaded"],
-                values["cached"],
-                values["error"],
-                utcnow(),
-                run_id,
-            ),
-        )
 
     def pending_jobs(self, run_id: str) -> list[sqlite3.Row]:
         with self.db.connect() as con:
@@ -225,11 +214,49 @@ class Repository:
                 (run_id,),
             ).fetchall()
 
+    def get_job(self, run_id: str, vacancy_id: str) -> sqlite3.Row:
+        with self.db.connect() as con:
+            row = con.execute(
+                "SELECT * FROM jobs WHERE run_id=? AND kind='vacancy' AND target=?",
+                (run_id, vacancy_id),
+            ).fetchone()
+        if not row:
+            raise KeyError((run_id, vacancy_id))
+        return row
+
+    @staticmethod
+    def _update_outcome_count(
+        con: sqlite3.Connection, run_id: str, old_state: str, new_state: str
+    ) -> None:
+        columns = {"loaded": "loaded", "cached": "cached", "error": "errors"}
+        deltas = {name: 0 for name in columns.values()}
+        if old_state in columns:
+            deltas[columns[old_state]] -= 1
+        if new_state in columns:
+            deltas[columns[new_state]] += 1
+        assignments = [f"{name}={name}+?" for name, delta in deltas.items() if delta]
+        values = [delta for delta in deltas.values() if delta]
+        if assignments:
+            con.execute(
+                f"UPDATE runs SET {','.join(assignments)},updated_at=? WHERE id=?",
+                (*values, utcnow(), run_id),
+            )
+
+    def start_job(self, job_id: int) -> None:
+        with self.db.transaction() as con:
+            job = con.execute("SELECT run_id,state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if not job:
+                raise KeyError(job_id)
+            con.execute(
+                "UPDATE jobs SET state='running',attempts=attempts+1 WHERE id=?", (job_id,)
+            )
+            self._update_outcome_count(con, job["run_id"], job["state"], "running")
+
     def finish_job(self, job_id: int, state: str, error: str | None = None) -> None:
         if state not in {"loaded", "cached", "error", "queued"}:
             raise ValueError("invalid job outcome")
         with self.db.transaction() as con:
-            job = con.execute("SELECT run_id,target FROM jobs WHERE id=?", (job_id,)).fetchone()
+            job = con.execute("SELECT run_id,target,state FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not job:
                 raise KeyError(job_id)
             con.execute("UPDATE jobs SET state=?,error=? WHERE id=?", (state, error, job_id))
@@ -237,7 +264,7 @@ class Repository:
                 "UPDATE run_vacancies SET outcome=? WHERE run_id=? AND vacancy_id=?",
                 (state, job["run_id"], job["target"]),
             )
-            self._sync_counts(con, job["run_id"])
+            self._update_outcome_count(con, job["run_id"], job["state"], state)
 
     def save_vacancy_and_finish_job(
         self, vacancy: Vacancy, job_id: int | None = None, outcome: str = "loaded"
@@ -300,13 +327,15 @@ class Repository:
                 ),
             )
             if job_id is not None:
-                job = con.execute("SELECT run_id,target FROM jobs WHERE id=?", (job_id,)).fetchone()
+                job = con.execute(
+                    "SELECT run_id,target,state FROM jobs WHERE id=?", (job_id,)
+                ).fetchone()
                 con.execute("UPDATE jobs SET state='loaded',error=NULL WHERE id=?", (job_id,))
                 con.execute(
                     "UPDATE run_vacancies SET outcome='loaded' WHERE run_id=? AND vacancy_id=?",
                     (job["run_id"], job["target"]),
                 )
-                self._sync_counts(con, job["run_id"])
+                self._update_outcome_count(con, job["run_id"], job["state"], "loaded")
             return changed
 
     def get_vacancy(self, vacancy_id: str) -> tuple[Vacancy, dict]:

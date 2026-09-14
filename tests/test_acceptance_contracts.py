@@ -213,6 +213,22 @@ async def test_vacancy_ttl_cache_is_bypassed_only_by_refresh(tmp_path):
 
 
 @pytest.mark.asyncio
+async def test_old_parser_version_invalidates_fresh_detail_cache(tmp_path):
+    collector = Collector(tmp_path)
+    cached = vacancy(title="Old parser")
+    cached.parser_version = "1"
+    cached.fetched_at = datetime.now(UTC)
+    collector.repo.save_vacancy_and_finish_job(cached)
+    browser = DetailBrowser(title="Reparsed")
+
+    value, from_cache = await collector._load_vacancy(browser, "1", cached.url, False)
+
+    assert from_cache is False
+    assert value.title == "Reparsed"
+    assert browser.fetches == 1
+
+
+@pytest.mark.asyncio
 async def test_listing_mismatch_invalidates_a_fresh_detail_cache(tmp_path, monkeypatch):
     collector = Collector(tmp_path)
     cached = vacancy(title="Old title")
@@ -335,3 +351,95 @@ async def test_mcp_public_resume_accepts_orphaned_incomplete_state(
     assert result == {"run_id": run_id, "state": "queued"}
     assert local.repo.get_run(run_id).complete is True
     assert lock.released
+
+
+@pytest.mark.asyncio
+async def test_structured_search_uses_url_and_reports_finished_progress(tmp_path, monkeypatch):
+    seen = []
+
+    class DirectBrowser(PageBrowser):
+        async def iter_search_pages(self, url):
+            seen.append(url)
+            yield SearchPage([], None), url
+
+        async def apply_structured_filters(self, _filters):
+            raise AssertionError("structured filters must not be clicked in the UI")
+
+    monkeypatch.setattr("hhmcp.service.BrowserAdapter", DirectBrowser)
+    collector = Collector(tmp_path)
+    run_id = collector.start([SearchSpec(text="HR Lead", area=["1"], employment=["full"])])
+    await collector.collect(run_id)
+
+    run = collector.repo.get_run(run_id)
+    assert seen and "area=1" in seen[0] and "employment=full" in seen[0]
+    assert run.state == "completed"
+    assert run.progress.phase == "finished"
+    assert run.progress.searches[0].complete is True
+
+
+@pytest.mark.asyncio
+async def test_detail_loading_is_bounded_to_three_workers(tmp_path, monkeypatch):
+    active = 0
+    maximum = 0
+
+    class ConcurrentBrowser(PageBrowser):
+        async def new_page_adapter(self):
+            return self
+
+        async def close_page(self):
+            return None
+
+    ConcurrentBrowser.pages_by_url = {
+        SEARCH_URL: [
+            SearchPage(
+                [SearchItem(str(i), f"https://hh.ru/vacancy/{i}") for i in range(1, 5)],
+                None,
+            )
+        ]
+    }
+
+    async def load(self, _browser, vacancy_id, _url, _refresh, job_id=None):
+        nonlocal active, maximum
+        active += 1
+        maximum = max(maximum, active)
+        await asyncio.sleep(0.01)
+        value = vacancy(vacancy_id)
+        self.repo.save_vacancy_and_finish_job(value, job_id)
+        active -= 1
+        return value, False
+
+    monkeypatch.setattr("hhmcp.service.BrowserAdapter", ConcurrentBrowser)
+    monkeypatch.setattr(Collector, "_load_vacancy", load)
+    collector = Collector(tmp_path)
+    run_id = collector.start([SearchSpec(url=SEARCH_URL)])
+    await collector.collect(run_id)
+
+    assert maximum == 3
+    assert collector.repo.get_run(run_id).loaded == 4
+
+
+@pytest.mark.asyncio
+async def test_vacancy_collection_does_not_fetch_employer_page(tmp_path):
+    class VacancyBrowser:
+        last_status = 200
+        last_availability = "active"
+
+        def __init__(self):
+            self.urls = []
+
+        async def fetch_html(self, url, *, readiness):
+            self.urls.append((url, readiness))
+            return (
+                '<h1 data-qa="vacancy-title">HR Lead</h1>'
+                '<a data-qa="vacancy-company-name" href="/employer/42">Acme</a>'
+                '<div data-qa="vacancy-description">Description</div>',
+                url,
+            )
+
+    browser = VacancyBrowser()
+    collector = Collector(tmp_path)
+    await collector._load_vacancy(browser, "1", "https://hh.ru/vacancy/1", True)
+
+    assert browser.urls == [("https://hh.ru/vacancy/1", "vacancy")]
+    with collector.repo.db.connect() as con:
+        assert con.execute("SELECT COUNT(*) FROM employers").fetchone()[0] == 0

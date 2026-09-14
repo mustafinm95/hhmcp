@@ -1,14 +1,26 @@
 from __future__ import annotations
 
+import asyncio
 import json
+import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
-from urllib.parse import urlencode
+from urllib.parse import parse_qs, urlencode, urlparse
 
 from .browser import BrowserAdapter, BrowserBlocked, PageNotReady
 from .db import Database
 from .lock import CollectorLock
-from .models import Employer, FieldState, Salary, SearchSpec, Vacancy
+from .models import (
+    PARSER_VERSION,
+    ActiveVacancy,
+    Employer,
+    FieldState,
+    RunProgress,
+    Salary,
+    SearchProgress,
+    SearchSpec,
+    Vacancy,
+)
 from .parsing import parse_employer_page, parse_salary, parse_vacancy_page, validate_search_url
 from .repository import Repository
 
@@ -84,6 +96,14 @@ class Collector:
     def cancel(self, run_id: str) -> None:
         self.cancelled.add(run_id)
         self.repo.set_run_state(run_id, "cancelled", "cancelled by user", False)
+        self.finish_progress(run_id)
+
+    def finish_progress(self, run_id: str, *, paused: bool = False) -> None:
+        progress = self.repo.get_run(run_id).progress
+        progress.phase = "paused" if paused else "finished"
+        progress.current_search = None
+        progress.active_vacancies = []
+        self.repo.set_progress(run_id, progress)
 
     async def collect(self, run_id: str, *, refresh: bool = False) -> None:
         lock = CollectorLock(self.data_dir / "collector.lock")
@@ -93,6 +113,7 @@ class Collector:
         except Exception as exc:
             if self.repo.get_run(run_id).state not in ("paused", "cancelled"):
                 self.repo.set_run_state(run_id, "failed", str(exc), False)
+                self.finish_progress(run_id)
             raise
 
     async def _collect_locked(self, run_id: str, *, refresh: bool) -> None:
@@ -104,128 +125,257 @@ class Collector:
             )
         with self.repo.db.connect() as con:
             checkpoints = con.execute(
-                "SELECT position,final_url FROM run_searches WHERE run_id=? ORDER BY position",
+                "SELECT position,final_url,complete FROM run_searches WHERE run_id=? ORDER BY position",
                 (run_id,),
             ).fetchall()
+            discovered_by_search = {
+                row["search_position"]: row["count"]
+                for row in con.execute(
+                    """SELECT search_position,COUNT(*) AS count FROM run_vacancies
+                       WHERE run_id=? GROUP BY search_position""",
+                    (run_id,),
+                )
+            }
         urls = [
             row["final_url"] or search_url(spec)
             for row, spec in zip(checkpoints, run.search_specs, strict=True)
         ]
-        page_iters = []
+        searches = [
+            SearchProgress(
+                position=position,
+                label=spec.text or spec.url or f"search {position + 1}",
+                url=url,
+                page=int(parse_qs(urlparse(url).query).get("page", ["0"])[0]) + 1,
+                complete=bool(checkpoints[position]["complete"]),
+                discovered=discovered_by_search.get(position, 0),
+            )
+            for position, (spec, url) in enumerate(zip(run.search_specs, urls, strict=True))
+        ]
+        progress = RunProgress(phase="discovering", searches=searches)
+        progress_lock = asyncio.Lock()
+        last_progress_write = 0.0
+        self.repo.set_progress(run_id, progress)
+
+        async def save_progress(*, force: bool = False) -> None:
+            nonlocal last_progress_write
+            async with progress_lock:
+                progress.pending_details = queue.qsize()
+                if not force and time.monotonic() - last_progress_write < 0.25:
+                    return
+                self.repo.set_progress(run_id, progress)
+                last_progress_write = time.monotonic()
+
+        page_iters = {}
+        queue: asyncio.Queue = asyncio.Queue()
+        stop_workers = asyncio.Event()
+        accepted_count = run.accepted
+        limit_reached = accepted_count >= run.limit
         async with BrowserAdapter(
             headless=self.headless, profile_dir=self.data_dir / "browser-profile"
         ) as browser:
-            for job in self.repo.pending_jobs(run_id):
-                if not await self._process_job(browser, run_id, job, refresh):
-                    return
-            for url, spec, checkpoint in zip(urls, run.search_specs, checkpoints, strict=True):
-                page_iters.append(
-                    self._iter_search(browser, spec, url, bool(checkpoint["final_url"])).__aiter__()
-                )
-            active = list(range(len(page_iters)))
-            while active:
-                for pos in list(active):
-                    if run_id in self.cancelled or self.repo.get_run(run_id).state == "cancelled":
+            worker_browsers = []
+            if hasattr(browser, "new_page_adapter"):
+                worker_browsers = [await browser.new_page_adapter() for _ in range(3)]
+            else:
+                worker_browsers = [browser]
+
+            async def worker(worker_browser) -> None:
+                while True:
+                    job = await queue.get()
+                    if job is None:
+                        queue.task_done()
                         return
+                    if stop_workers.is_set():
+                        queue.task_done()
+                        return
+                    payload = json.loads(job["payload_json"])
+                    observed = payload.get("observed") or {}
+                    active_vacancy = ActiveVacancy(
+                        hh_id=job["target"], title=observed.get("title")
+                    )
+                    async with progress_lock:
+                        if progress.current_search is None:
+                            progress.phase = "loading_vacancies"
+                        progress.active_vacancies.append(active_vacancy)
+                        progress.pending_details = queue.qsize()
+                    await save_progress()
                     try:
-                        page, final_url = await anext(page_iters[pos])
-                    except StopAsyncIteration:
-                        active.remove(pos)
+                        if not await self._process_job(
+                            worker_browser, run_id, job, refresh
+                        ):
+                            stop_workers.set()
+                    finally:
+                        async with progress_lock:
+                            progress.active_vacancies = [
+                                item
+                                for item in progress.active_vacancies
+                                if item.hh_id != job["target"]
+                            ]
+                            progress.pending_details = queue.qsize()
+                        await save_progress()
+                        queue.task_done()
+
+            workers = [asyncio.create_task(worker(value)) for value in worker_browsers]
+            try:
+                for job in self.repo.pending_jobs(run_id):
+                    await queue.put(job)
+                await save_progress()
+                for pos, (url, spec, checkpoint) in enumerate(
+                    zip(urls, run.search_specs, checkpoints, strict=True)
+                ):
+                    if checkpoint["complete"]:
+                        continue
+                    page_iters[pos] = self._iter_search(
+                        browser, spec, url, bool(checkpoint["final_url"])
+                    ).__aiter__()
+                active = list(page_iters)
+                while active and not limit_reached and not stop_workers.is_set():
+                    for pos in list(active):
+                        if run_id in self.cancelled or self.repo.get_run(run_id).state == "cancelled":
+                            stop_workers.set()
+                            break
+                        progress.phase = "discovering"
+                        progress.current_search = searches[pos]
+                        await save_progress(force=True)
+                        try:
+                            page, final_url = await anext(page_iters[pos])
+                        except StopAsyncIteration:
+                            active.remove(pos)
+                            searches[pos].complete = True
+                            with self.repo.db.transaction() as con:
+                                con.execute(
+                                    "UPDATE run_searches SET complete=1 WHERE run_id=? AND position=?",
+                                    (run_id, pos),
+                                )
+                            await save_progress(force=True)
+                            continue
+                        except BrowserBlocked as exc:
+                            self.repo.set_run_state(run_id, "paused", str(exc), False)
+                            progress.phase = "paused"
+                            stop_workers.set()
+                            await save_progress(force=True)
+                            break
+                        except PageNotReady as exc:
+                            self.repo.set_run_state(run_id, "interrupted", str(exc), False)
+                            stop_workers.set()
+                            break
+                        searches[pos].url = final_url
+                        searches[pos].page = (
+                            int(parse_qs(urlparse(final_url).query).get("page", ["0"])[0]) + 1
+                        )
+                        if page.unchecked_parameters:
+                            missing = ", ".join(page.unchecked_parameters)
+                            self.repo.set_run_state(
+                                run_id,
+                                "interrupted",
+                                f"search filters were not retained: {missing}",
+                                False,
+                            )
+                            stop_workers.set()
+                            break
                         with self.repo.db.transaction() as con:
                             con.execute(
-                                "UPDATE run_searches SET complete=1 WHERE run_id=? AND position=?",
-                                (run_id, pos),
-                            )
-                        continue
-                    except BrowserBlocked as exc:
-                        self.repo.set_run_state(run_id, "paused", str(exc), False)
-                        return
-                    except PageNotReady as exc:
-                        self.repo.set_run_state(run_id, "interrupted", str(exc), False)
-                        return
-                    with self.repo.db.transaction() as con:
-                        con.execute(
-                            "UPDATE run_searches SET final_url=?,applied_filters_json=? WHERE run_id=? AND position=?",
-                            (
-                                final_url,
-                                json.dumps(
-                                    {
-                                        "applied": page.applied_filters,
-                                        "unchecked": page.unchecked_parameters,
-                                    }
+                                "UPDATE run_searches SET final_url=?,applied_filters_json=? WHERE run_id=? AND position=?",
+                                (
+                                    final_url,
+                                    json.dumps(
+                                        {
+                                            "applied": page.applied_filters,
+                                            "unchecked": page.unchecked_parameters,
+                                        }
+                                    ),
+                                    run_id,
+                                    pos,
                                 ),
+                            )
+                        for item in page.items:
+                            discovered, accepted, _ = self.repo.record_observation(
                                 run_id,
                                 pos,
-                            ),
-                        )
-                    for item in page.items:
-                        _, accepted, rejected_by_limit = self.repo.record_observation(
-                            run_id,
-                            pos,
-                            item.hh_id,
-                            item.url,
-                            run.limit,
-                            {
-                                "title": item.title,
-                                "employer_name": item.employer_name,
-                                "salary_text": item.salary_text,
-                            },
-                        )
-                        if rejected_by_limit:
-                            self.repo.set_run_state(
-                                run_id, "interrupted", "unique vacancy limit reached", False
+                                item.hh_id,
+                                item.url,
+                                run.limit,
+                                {
+                                    "title": item.title,
+                                    "employer_name": item.employer_name,
+                                    "salary_text": item.salary_text,
+                                    "published_text": item.published_text,
+                                    "conditions": item.conditions,
+                                },
                             )
-                            return
-                        if not accepted:
-                            continue
-                        job = next(
-                            value
-                            for value in self.repo.pending_jobs(run_id)
-                            if value["target"] == item.hh_id
-                        )
-                        if not await self._process_job(browser, run_id, job, refresh):
-                            return
-                        if self.repo.get_run(run_id).accepted >= run.limit:
-                            self.repo.set_run_state(
-                                run_id, "interrupted", "unique vacancy limit reached", False
+                            if discovered:
+                                searches[pos].discovered += 1
+                            if accepted:
+                                accepted_count += 1
+                                await queue.put(self.repo.get_job(run_id, item.hh_id))
+                            if accepted_count >= run.limit:
+                                limit_reached = True
+                                break
+                        if page.next_url and not limit_reached:
+                            searches[pos].url = page.next_url
+                            searches[pos].page = (
+                                int(
+                                    parse_qs(urlparse(page.next_url).query).get("page", ["0"])[0]
+                                )
+                                + 1
                             )
-                            return
-            final = self.repo.get_run(run_id)
-            self.repo.set_run_state(
-                run_id,
-                "completed",
-                "one or more vacancy details failed" if final.errors else None,
-                not bool(final.errors),
-            )
+                        await save_progress()
+                        if limit_reached or stop_workers.is_set():
+                            break
+
+                if stop_workers.is_set():
+                    progress.current_search = None
+                    progress.active_vacancies = []
+                    progress.phase = (
+                        "paused" if self.repo.get_run(run_id).state == "paused" else "finished"
+                    )
+                    await save_progress(force=True)
+                    return
+                progress.current_search = None
+                progress.phase = "loading_vacancies"
+                await save_progress(force=True)
+                join_task = asyncio.create_task(queue.join())
+                stop_task = asyncio.create_task(stop_workers.wait())
+                done, _ = await asyncio.wait(
+                    {join_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for task in ({join_task, stop_task} - done):
+                    task.cancel()
+                if stop_workers.is_set():
+                    progress.phase = "paused"
+                    await save_progress(force=True)
+                    return
+                final = self.repo.get_run(run_id)
+                if limit_reached:
+                    self.repo.set_run_state(
+                        run_id, "interrupted", "unique vacancy limit reached", False
+                    )
+                else:
+                    self.repo.set_run_state(
+                        run_id,
+                        "completed",
+                        "one or more vacancy details failed" if final.errors else None,
+                        not bool(final.errors),
+                    )
+                progress.phase = "finished"
+                progress.active_vacancies = []
+                progress.pending_details = 0
+                await save_progress(force=True)
+            finally:
+                for iterator in page_iters.values():
+                    close = getattr(iterator, "aclose", None)
+                    if close:
+                        await close()
+                for _ in workers:
+                    await queue.put(None)
+                await asyncio.gather(*workers, return_exceptions=True)
+                for worker_browser in worker_browsers:
+                    if worker_browser is not browser and hasattr(worker_browser, "close_page"):
+                        await worker_browser.close_page()
 
     async def _iter_search(self, browser, spec: SearchSpec, url: str, resumed: bool):
-        if spec.url or resumed:
-            async for value in browser.iter_search_pages(url):
-                yield value
-            return
-        filters: dict[str, str | list[str]] = {}
-        for name in (
-            "text",
-            "area",
-            "salary",
-            "experience",
-            "employment",
-            "schedule",
-            "working_hours",
-            "work_format",
-            "period",
-            "order_by",
-        ):
-            value = getattr(spec, name)
-            if value not in (None, [], ""):
-                filters[name] = str(value) if not isinstance(value, list) else value
-        if spec.exclude:
-            filters["excluded_text"] = spec.exclude
-        first, final_url = await browser.apply_structured_filters(filters)
-        yield first, final_url
-        if first.next_url:
-            async for value in browser.iter_search_pages(first.next_url):
-                yield value
+        async for value in browser.iter_search_pages(url):
+            yield value
 
     async def _process_job(self, browser, run_id: str, job, refresh: bool) -> bool:
         payload = json.loads(job["payload_json"])
@@ -247,10 +397,7 @@ class Collector:
                 )
             except KeyError:
                 pass
-        with self.repo.db.transaction() as con:
-            con.execute(
-                "UPDATE jobs SET state='running',attempts=attempts+1 WHERE id=?", (job["id"],)
-            )
+        self.repo.start_job(job["id"])
         try:
             _, from_cache = await self._load_vacancy(
                 browser,
@@ -282,18 +429,36 @@ class Collector:
             try:
                 cached, meta = self.repo.get_vacancy(vacancy_id)
                 age = datetime.now(UTC) - datetime.fromisoformat(meta["fetched_at"])
-                if age <= DETAIL_TTL:
+                if age <= DETAIL_TTL and meta["parser_version"] == PARSER_VERSION:
                     cached.cache_age_seconds = int(age.total_seconds())
                     return cached, True
             except KeyError:
                 pass
         source, final_url = await browser.fetch_html(url, readiness="vacancy")
-        parsed = parse_vacancy_page(source, final_url)
-        terminal = parsed.archived or parsed.unavailable
+        observed = None
+        if job_id is not None:
+            with self.repo.db.connect() as con:
+                row = con.execute("SELECT payload_json FROM jobs WHERE id=?", (job_id,)).fetchone()
+            if row:
+                observed = json.loads(row[0]).get("observed")
+        browser_availability = getattr(browser, "last_availability", None)
+        if f"/vacancy/{vacancy_id}" not in final_url:
+            browser_availability = "unavailable"
+        parsed = parse_vacancy_page(
+            source,
+            final_url,
+            availability=browser_availability,
+            http_status=getattr(browser, "last_status", None),
+            fallback_fields=observed,
+            visible_fields=getattr(browser, "last_visible_fields", None),
+        )
+        terminal = parsed.availability in {"archived", "unavailable"}
         if (not parsed.title or not parsed.description_text) and not terminal:
             raise ValueError("vacancy title or description was not extracted")
         states = {
-            name: FieldState(value=value.value, state=value.state, error=value.error)
+            name: FieldState(
+                value=value.value, state=value.state, error=value.error, source=value.source
+            )
             for name, value in parsed.field_states.items()
         }
         states["skills"] = FieldState(
@@ -306,6 +471,15 @@ class Collector:
             error=None
             if parsed.skills or "ключевые навыки" in source.casefold()
             else "selector missing",
+        )
+        states["availability"] = FieldState(
+            value=parsed.availability,
+            state="value" if parsed.availability != "unknown" else "absent",
+            source=(
+                "http"
+                if getattr(browser, "last_status", None) in {404, 410}
+                else ("dom" if browser_availability else None)
+            ),
         )
         if terminal:
             for name in ("title", "description"):
@@ -339,6 +513,7 @@ class Collector:
             contacts={"text": parsed.contacts} if parsed.contacts else {},
             archived=parsed.archived,
             unavailable=parsed.unavailable,
+            availability=parsed.availability,
             field_states=states,
         )
         if job_id is not None:
@@ -353,14 +528,6 @@ class Collector:
         self.repo.save_vacancy_and_finish_job(vacancy, job_id)
         if self.repo.is_employer_excluded(vacancy.employer_id):
             self.repo.update_local(vacancy.hh_id, status="скрыто")
-        if parsed.employer_id and parsed.employer_url:
-            try:
-                await self._load_employer(browser, parsed.employer_id, parsed.employer_url, refresh)
-            except BrowserBlocked:
-                raise
-            except Exception:
-                # Employer freshness is independent from a successfully committed vacancy.
-                pass
         return vacancy, False
 
     async def _load_employer(

@@ -6,11 +6,14 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
+PARSER_VERSION = "2"
+
 
 class FieldState(BaseModel):
     value: Any = None
     state: Literal["value", "absent", "error"] = "absent"
     error: str | None = None
+    source: Literal["dom", "http", "json_ld", "listing", "description"] | None = None
 
 
 class Salary(BaseModel):
@@ -86,11 +89,23 @@ class Vacancy(BaseModel):
     contacts: dict[str, Any] = Field(default_factory=dict)
     archived: bool = False
     unavailable: bool = False
-    parser_version: str = "1"
+    availability: Literal["active", "archived", "unavailable", "unknown"] = "unknown"
+    parser_version: str = PARSER_VERSION
     field_states: dict[str, FieldState] = Field(default_factory=dict)
     discovered_at: datetime | None = None
     fetched_at: datetime | None = None
     cache_age_seconds: int | None = None
+
+    @model_validator(mode="after")
+    def synchronize_availability(self):
+        if self.availability == "unknown":
+            if self.archived:
+                self.availability = "archived"
+            elif self.unavailable:
+                self.availability = "unavailable"
+        self.archived = self.availability == "archived"
+        self.unavailable = self.availability == "unavailable"
+        return self
 
 
 class RunState(StrEnum):
@@ -101,6 +116,30 @@ class RunState(StrEnum):
     completed = "completed"
     failed = "failed"
     cancelled = "cancelled"
+
+
+class SearchProgress(BaseModel):
+    position: int
+    label: str
+    url: str
+    page: int = 0
+    complete: bool = False
+    discovered: int = 0
+
+
+class ActiveVacancy(BaseModel):
+    hh_id: str
+    title: str | None = None
+
+
+class RunProgress(BaseModel):
+    phase: Literal["queued", "discovering", "loading_vacancies", "paused", "finished"] = (
+        "queued"
+    )
+    current_search: SearchProgress | None = None
+    searches: list[SearchProgress] = Field(default_factory=list)
+    active_vacancies: list[ActiveVacancy] = Field(default_factory=list)
+    pending_details: int = 0
 
 
 class Run(BaseModel):
@@ -117,6 +156,7 @@ class Run(BaseModel):
     cached: int = 0
     errors: int = 0
     search_specs: list[SearchSpec] = Field(default_factory=list)
+    progress: RunProgress = Field(default_factory=RunProgress)
 
 
 class Criterion(BaseModel):

@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import time
 
 from hhmcp.browser import BrowserAdapter
 from hhmcp.parsing import parse_employer_page, parse_vacancy_page
 
 
 async def main() -> None:
+    started = time.monotonic()
     result = {"pages": [], "vacancies": [], "employers": [], "filter_checks": []}
     employer_urls: list[str] = []
     async with BrowserAdapter(headless=True) as browser:
@@ -30,6 +32,11 @@ async def main() -> None:
                         "id": vacancy.hh_id,
                         "title": vacancy.title,
                         "description": bool(vacancy.description_text),
+                        "availability": vacancy.availability,
+                        "published_at": vacancy.published_at.isoformat()
+                        if vacancy.published_at
+                        else None,
+                        "conditions": vacancy.conditions,
                     }
                 )
                 if vacancy.employer_url and vacancy.employer_url not in employer_urls:
@@ -42,8 +49,18 @@ async def main() -> None:
             url = f"https://hh.ru/search/vacancy?text=python&area=1&{parameter}"
             async for page, final_url in browser.iter_search_pages(url, max_pages=1):
                 result["filter_checks"].append(
-                    {"parameter": parameter, "url": final_url, "items": len(page.items)}
+                    {
+                        "parameter": parameter,
+                        "url": final_url,
+                        "items": len(page.items),
+                        "unchecked": page.unchecked_parameters,
+                    }
                 )
+    elapsed = time.monotonic() - started
+    result["benchmark"] = {
+        "elapsed_seconds": round(elapsed, 2),
+        "vacancies_per_minute": round(60 * len(result["vacancies"]) / elapsed, 2),
+    }
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

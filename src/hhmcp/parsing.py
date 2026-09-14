@@ -8,6 +8,7 @@ executing scripts from vacancy descriptions.
 from __future__ import annotations
 
 import html
+import json
 import re
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
@@ -45,6 +46,8 @@ class SearchItem:
     title: str | None = None
     employer_name: str | None = None
     salary_text: str | None = None
+    published_text: str | None = None
+    conditions: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -62,6 +65,7 @@ class ExtractedField:
     value: object = None
     state: str = "absent"
     error: str | None = None
+    source: str | None = None
 
 
 @dataclass(slots=True)
@@ -90,6 +94,7 @@ class VacancyPage:
     contacts: str | None
     archived: bool
     unavailable: bool = False
+    availability: str = "unknown"
     salary: ParsedSalary | None = None
     conditions: dict[str, str] = field(default_factory=dict)
     department_name: str | None = None
@@ -184,8 +189,26 @@ def _qa(node: _Node, *values: str) -> bool:
     return any(value == qa or value in qa.split() for value in values)
 
 
+def _statically_hidden(node: _Node) -> bool:
+    current: _Node | None = node
+    while current is not None:
+        style = current.attrs.get("style", "").replace(" ", "").casefold()
+        if (
+            "hidden" in current.attrs
+            or current.attrs.get("aria-hidden", "").casefold() == "true"
+            or "display:none" in style
+            or "visibility:hidden" in style
+        ):
+            return True
+        current = current.parent
+    return False
+
+
 def _first(root: _Node, *qas: str) -> _Node | None:
-    return next((node for node in root.descendants() if _qa(node, *qas)), None)
+    return next(
+        (node for node in root.descendants() if _qa(node, *qas) and not _statically_hidden(node)),
+        None,
+    )
 
 
 def _inner_html(node: _Node | None) -> str | None:
@@ -223,15 +246,92 @@ def _field(root: _Node, *qas: str) -> ExtractedField:
     value = node.text
     if not value:
         return ExtractedField(state="error", error="matched element is empty")
-    return ExtractedField(value=value, state="value")
+    return ExtractedField(value=value, state="value", source="dom")
+
+
+def _raw_text(node: _Node) -> str:
+    return "".join(item if isinstance(item, str) else _raw_text(item) for item in node.content)
+
+
+def _json_ld_job(root: _Node) -> dict:
+    def find_job(value):
+        if isinstance(value, dict):
+            kind = value.get("@type")
+            if kind == "JobPosting" or (isinstance(kind, list) and "JobPosting" in kind):
+                return value
+            for child in value.values():
+                found = find_job(child)
+                if found:
+                    return found
+        elif isinstance(value, list):
+            for child in value:
+                found = find_job(child)
+                if found:
+                    return found
+        return None
+
+    for node in root.descendants():
+        if node.tag != "script" or "ld+json" not in node.attrs.get("type", "").casefold():
+            continue
+        try:
+            found = find_job(json.loads(_raw_text(node)))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            continue
+        if found:
+            return found
+    return {}
+
+
+def _conditions_from_text(text: str) -> dict[str, str]:
+    normalized = re.sub(r"\s+", " ", text).strip().casefold()
+    result: dict[str, str] = {}
+    patterns = {
+        "employment": (
+            (r"\bполная занятость\b", "Полная занятость"),
+            (r"\bчастичная занятость\b", "Частичная занятость"),
+        ),
+        "work_format": (
+            (r"\b(?:формат работы\s*[:—-]?\s*)?гибрид(?:ный формат)?\b", "Гибрид"),
+            (r"\bудал[её]нная работа\b|\bформат работы\s*[:—-]?\s*удал[её]н", "Удалённо"),
+            (r"\bработа в офисе\b|\bформат работы\s*[:—-]?\s*офис", "В офисе"),
+        ),
+    }
+    for field_name, candidates in patterns.items():
+        for pattern, label in candidates:
+            if re.search(pattern, normalized):
+                result[field_name] = label
+                break
+    schedule = re.search(r"\bграфик(?: работы)?\s*[:—-]?\s*(\d\s*/\s*\d)\b", normalized)
+    if schedule:
+        result["schedule"] = schedule.group(1).replace(" ", "")
+    elif re.search(r"\bполный день\b", normalized):
+        result["schedule"] = "Полный день"
+    elif re.search(r"\bсменный график\b", normalized):
+        result["schedule"] = "Сменный график"
+    elif re.search(r"\bгибкий график\b", normalized):
+        result["schedule"] = "Гибкий график"
+    hours = re.search(
+        r"\b(?:рабоч(?:ий день|ие часы)|занятость)\s*[:—-]?\s*(\d{1,2})\s*час"
+        r"|\b(\d{1,2})\s*час(?:ов|а)?\s+в день\b",
+        normalized,
+    )
+    if hours:
+        result["hours"] = f"{hours.group(1) or hours.group(2)} часов"
+    return result
 
 
 def _published_at(root: _Node) -> datetime | None:
-    node = _first(root, "vacancy-creation-time")
+    node = _first(
+        root,
+        "vacancy-creation-time",
+        "vacancy-creation-time-redesigned",
+        "vacancy-view-creation-time",
+    )
     raw = (node.attrs.get("datetime") or node.attrs.get("content")) if node else None
     if raw:
         try:
-            return datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+            return value if value.tzinfo else value.replace(tzinfo=UTC)
         except ValueError:
             pass
     if not node:
@@ -345,6 +445,9 @@ def parse_search_page(source: str, base_url: str) -> SearchPage:
         salary = _first(
             context, "vacancy-serp__vacancy-compensation", "vacancy-serp__vacancy-salary"
         )
+        published = _first(
+            context, "vacancy-serp__vacancy-date", "vacancy-serp__publication-date"
+        )
         found.setdefault(
             hh_id,
             SearchItem(
@@ -353,6 +456,8 @@ def parse_search_page(source: str, base_url: str) -> SearchPage:
                 (title_node or node).text or None,
                 employer.text if employer else None,
                 salary.text if salary else None,
+                published.text if published else None,
+                _conditions_from_text(context.text),
             ),
         )
 
@@ -400,8 +505,18 @@ def parse_search_page(source: str, base_url: str) -> SearchPage:
     )
 
 
-def parse_vacancy_page(source: str, url: str) -> VacancyPage:
+def parse_vacancy_page(
+    source: str,
+    url: str,
+    *,
+    availability: str | None = None,
+    http_status: int | None = None,
+    fallback_fields: dict | None = None,
+    visible_fields: dict | None = None,
+) -> VacancyPage:
     root = _tree(source)
+    fallback_fields = fallback_fields or {}
+    json_ld = _json_ld_job(root)
     match = VACANCY_ID_RE.search(url)
     employer = _first(root, "vacancy-company-name", "vacancy-company-name-text")
     employer_link = (
@@ -420,36 +535,168 @@ def parse_vacancy_page(source: str, url: str) -> VacancyPage:
             and node.text not in skills
         ):
             skills.append(node.text)
-    archived_text = " ".join(
-        n.text for n in root.descendants() if _qa(n, "vacancy-archive", "vacancy-archived")
-    ).lower()
-    unavailable = any(
-        phrase in root.text.lower()
-        for phrase in ("вакансия недоступна", "вакансия удалена", "страница не найдена")
+    archived_nodes = [
+        n
+        for n in root.descendants()
+        if _qa(n, "vacancy-archive", "vacancy-archived") and not _statically_hidden(n)
+    ]
+    unavailable_nodes = [
+        n
+        for n in root.descendants()
+        if _qa(n, "vacancy-unavailable", "vacancy-not-found") and not _statically_hidden(n)
+    ]
+    leaf_texts = {
+        n.text.casefold()
+        for n in root.descendants()
+        if not n.children and not _statically_hidden(n)
+    }
+    archived = bool(archived_nodes) or "вакансия в архиве" in leaf_texts
+    unavailable = bool(unavailable_nodes) or bool(
+        leaf_texts
+        & {"вакансия недоступна", "вакансия удалена", "страница не найдена"}
     )
     title_field = _field(root, "vacancy-title", "vacancy-title-text")
     salary_field = _field(root, "vacancy-salary", "vacancy-salary-compensation-type-net")
     condition_qas = {
         "experience": ("vacancy-experience", "vacancy-view-experience"),
-        "employment": ("vacancy-employment",),
-        "schedule": ("vacancy-schedule", "vacancy-view-employment-mode"),
-        "hours": ("vacancy-working-hours", "working-hours"),
-        "work_format": ("vacancy-work-format", "work-format"),
+        "employment": ("vacancy-employment", "vacancy-view-employment-mode"),
+        "schedule": ("vacancy-schedule", "vacancy-work-schedule-by-days"),
+        "hours": ("vacancy-working-hours", "working-hours", "vacancy-working-hours-text"),
+        "work_format": ("vacancy-work-format", "work-format", "vacancy-work-format-text"),
     }
-    condition_fields = {key: _field(root, *qas) for key, qas in condition_qas.items()}
+    if visible_fields is None:
+        condition_fields = {key: _field(root, *qas) for key, qas in condition_qas.items()}
+    else:
+        visible_conditions = visible_fields.get("conditions") or {}
+        condition_fields = {
+            key: (
+                ExtractedField(value=visible_conditions[key], state="value", source="dom")
+                if visible_conditions.get(key)
+                else ExtractedField()
+            )
+            for key in condition_qas
+        }
+    condition_block = " ".join(
+        str(item.value) for item in condition_fields.values() if item.state == "value"
+    )
+    for key, extracted in condition_fields.items():
+        if extracted.state != "value":
+            continue
+        normalized_value = _conditions_from_text(str(extracted.value)).get(key)
+        if normalized_value:
+            extracted.value = normalized_value
+    description_conditions = _conditions_from_text(description.text if description else "")
+    page_conditions = _conditions_from_text(condition_block)
+    json_conditions: dict[str, str] = {}
+    employment_type = json_ld.get("employmentType")
+    if isinstance(employment_type, list):
+        employment_type = employment_type[0] if employment_type else None
+    employment_labels = {
+        "FULL_TIME": "Полная занятость",
+        "PART_TIME": "Частичная занятость",
+        "CONTRACTOR": "Проектная работа",
+        "TEMPORARY": "Временная работа",
+    }
+    if isinstance(employment_type, str):
+        json_conditions["employment"] = employment_labels.get(employment_type, employment_type)
+    if str(json_ld.get("jobLocationType", "")).casefold() == "telecommute":
+        json_conditions["work_format"] = "Удалённо"
+    listing_conditions = fallback_fields.get("conditions") or {}
+    for key, extracted in condition_fields.items():
+        if extracted.state == "value":
+            continue
+        for candidate, source_name in (
+            (page_conditions.get(key), "dom"),
+            (json_conditions.get(key), "json_ld"),
+            (listing_conditions.get(key), "listing"),
+            (description_conditions.get(key), "description"),
+        ):
+            if candidate:
+                condition_fields[key] = ExtractedField(
+                    value=str(candidate), state="value", source=source_name
+                )
+                break
+
+    published_at = _published_at(root)
+    published_qas = (
+        "vacancy-creation-time",
+        "vacancy-creation-time-redesigned",
+        "vacancy-view-creation-time",
+    )
+    published_node = _first(root, *published_qas)
+    published_text = published_node.text if published_node else None
+    published_state = _field(root, *published_qas)
+    if visible_fields is not None:
+        published_text = visible_fields.get("published_text") or None
+        visible_published = visible_fields.get("published_at") or published_text
+        published_at = None
+        published_state = ExtractedField()
+        if visible_published:
+            synthetic = _tree(
+                f'<time data-qa="vacancy-creation-time" '
+                f'datetime="{html.escape(str(visible_published), quote=True)}">'
+                f"{html.escape(str(visible_published))}</time>"
+            )
+            published_at = _published_at(synthetic)
+            published_state = ExtractedField(
+                value=str(visible_published),
+                state="value" if published_at else "error",
+                error=None if published_at else "publication date could not be parsed",
+                source="dom",
+            )
+    if published_at is None:
+        for raw, source_name in (
+            (json_ld.get("datePosted") or json_ld.get("datePublished"), "json_ld"),
+            (fallback_fields.get("published_at"), "listing"),
+            (fallback_fields.get("published_text"), "listing"),
+        ):
+            if not raw:
+                continue
+            synthetic = _tree(
+                f'<time data-qa="vacancy-creation-time" datetime="{html.escape(str(raw), quote=True)}">'
+                f"{html.escape(str(raw))}</time>"
+            )
+            value = _published_at(synthetic)
+            if value is not None:
+                published_at = value
+                published_text = published_text or str(raw)
+                published_state = ExtractedField(
+                    value=str(raw), state="value", source=source_name
+                )
+                break
+    if published_at is None and published_state.state == "value":
+        published_state = ExtractedField(
+            value=published_state.value,
+            state="error",
+            error="publication date could not be parsed",
+            source="dom",
+        )
     field_states = {
         "title": title_field,
         "description": _field(root, "vacancy-description"),
         "salary": salary_field,
         "address": _field(root, "vacancy-view-raw-address"),
         "metro": _field(root, "vacancy-view-raw-address-metro-station"),
-        "published_at": _field(root, "vacancy-creation-time"),
+        "published_at": published_state,
         "contacts": _field(root, "vacancy-contacts"),
         **condition_fields,
     }
     department_name = None
     if employer and employer.attrs.get("data-department"):
         department_name = employer.attrs["data-department"]
+    if http_status in {404, 410}:
+        availability = "unavailable"
+    elif availability is None:
+        if archived:
+            availability = "archived"
+        elif unavailable:
+            availability = "unavailable"
+        elif title_field.state == "value" and description is not None and description.text:
+            availability = "active"
+        else:
+            availability = "unknown"
+    archived = availability == "archived"
+    unavailable = availability == "unavailable"
     return VacancyPage(
         match.group(1) if match else None,
         str(title_field.value) if title_field.state == "value" else None,
@@ -465,18 +712,17 @@ def parse_vacancy_page(source: str, url: str) -> VacancyPage:
         _first(root, "vacancy-view-raw-address-metro-station").text
         if _first(root, "vacancy-view-raw-address-metro-station")
         else None,
-        _first(root, "vacancy-creation-time").text
-        if _first(root, "vacancy-creation-time")
-        else None,
+        published_text,
         skills,
         _first(root, "vacancy-contacts").text if _first(root, "vacancy-contacts") else None,
-        bool(archived_text) or "вакансия в архиве" in root.text.lower(),
+        archived,
         unavailable,
+        availability,
         parse_salary(str(salary_field.value)) if salary_field.state == "value" else None,
         {key: str(item.value) for key, item in condition_fields.items() if item.state == "value"},
         department_name,
         field_states,
-        _published_at(root),
+        published_at,
     )
 
 

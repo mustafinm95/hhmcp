@@ -66,9 +66,11 @@ async def _run_collection(run_id: str, refresh: bool, lock: CollectorLock) -> No
     except asyncio.CancelledError:
         if collector.repo.get_run(run_id).state != "cancelled":
             collector.repo.set_run_state(run_id, "interrupted", "MCP server stopped", False)
+            collector.finish_progress(run_id)
         raise
     except Exception as exc:
         collector.repo.set_run_state(run_id, "failed", str(exc), False)
+        collector.finish_progress(run_id)
         raise
     finally:
         lock.release()

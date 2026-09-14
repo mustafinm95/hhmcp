@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -15,7 +15,8 @@ CREATE TABLE IF NOT EXISTS runs(
  id TEXT PRIMARY KEY, state TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
  stop_reason TEXT, complete INTEGER NOT NULL DEFAULT 0, limit_count INTEGER NOT NULL,
  discovered INTEGER NOT NULL DEFAULT 0, accepted INTEGER NOT NULL DEFAULT 0,
- loaded INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0
+ loaded INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
+ progress_json TEXT NOT NULL DEFAULT '{}'
 );
 CREATE TABLE IF NOT EXISTS run_searches(
  run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL, spec_json TEXT NOT NULL,
@@ -101,4 +102,11 @@ class Database:
             if not row:
                 con.execute(
                     "INSERT INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),)
+                )
+            elif int(row[0]) < 2:
+                columns = {item[1] for item in con.execute("PRAGMA table_info(runs)")}
+                if "progress_json" not in columns:
+                    con.execute("ALTER TABLE runs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'")
+                con.execute(
+                    "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
                 )

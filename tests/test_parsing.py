@@ -1,7 +1,12 @@
 import asyncio
 import unittest
 
-from hhmcp.browser import wait_for_stable_nonzero_count
+from hhmcp.browser import (
+    BrowserAdapter,
+    PageNotReady,
+    retained_search_filters,
+    wait_for_stable_nonzero_count,
+)
 from hhmcp.parsing import (
     InvalidHHUrl,
     parse_employer_page,
@@ -56,6 +61,15 @@ class ParserTests(unittest.TestCase):
         )
         self.assertTrue(archived.archived)
 
+        combined = parse_vacancy_page(
+            '<h1 data-qa="vacancy-title">Lead</h1>'
+            '<div data-qa="vacancy-description">Details</div>'
+            '<p data-qa="vacancy-view-employment-mode">Полная занятость, полный день</p>',
+            "https://hh.ru/vacancy/17",
+        )
+        self.assertEqual(combined.conditions["employment"], "Полная занятость")
+        self.assertEqual(combined.conditions["schedule"], "Полный день")
+
     def test_delayed_search_render_waits_past_initial_stable_zero(self):
         values = iter([0, 0, 0, 1, 1, 1, 1, 1])
         calls = 0
@@ -73,6 +87,22 @@ class ParserTests(unittest.TestCase):
         )
         self.assertEqual(result, 1)
         self.assertEqual(calls, 8)
+
+    def test_http_429_uses_retry_path_instead_of_parsing_page(self):
+        class Response:
+            status = 429
+
+            async def all_headers(self):
+                return {"retry-after": "1"}
+
+        class Page:
+            async def goto(self, *_args, **_kwargs):
+                return Response()
+
+        browser = BrowserAdapter(retries=1)
+        browser._page = Page()
+        with self.assertRaisesRegex(PageNotReady, "HTTP 429"):
+            asyncio.run(browser.fetch_html("https://hh.ru/vacancy/1", readiness="vacancy"))
 
     def test_search_parsing_deduplicates_excludes_ads_and_finds_next(self):
         html = """
@@ -143,6 +173,23 @@ class ParserTests(unittest.TestCase):
             else:
                 self.fail(bad)
 
+    def test_filter_verification_uses_final_url_and_ignores_service_parameters(self):
+        request = (
+            "https://hh.ru/search/vacancy?text=HR&area=1&area=2&employment=full"
+            "&search_session_id=old"
+        )
+        applied, missing = retained_search_filters(
+            request,
+            "https://hh.ru/search/vacancy?employment=full&area=2&area=1&text=HR&page=1",
+        )
+        self.assertEqual(applied["area"], ["1", "2"])
+        self.assertEqual(missing, [])
+
+        _, missing = retained_search_filters(
+            request, "https://hh.ru/search/vacancy?employment=full&text=HR"
+        )
+        self.assertEqual(missing, ["area"])
+
     def test_mixed_text_order_and_script_style_are_removed(self):
         result = parse_vacancy_page(
             '<h1 data-qa="vacancy-title">Python</h1>'
@@ -153,6 +200,70 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(result.description_text, "от 100 до 200")
         self.assertNotIn("script", result.description_html or "")
         self.assertNotIn("style", result.description_html or "")
+
+    def test_hidden_terminal_templates_do_not_mark_active_vacancy_closed(self):
+        result = parse_vacancy_page(
+            '<div style="display:none"><span>Вакансия в архиве</span>'
+            '<span>Страница не найдена</span></div>'
+            '<h1 data-qa="vacancy-title">HR Lead</h1>'
+            '<div data-qa="vacancy-description">Полная занятость, удалённая работа</div>',
+            "https://hh.ru/vacancy/12",
+        )
+        self.assertEqual(result.availability, "active")
+        self.assertFalse(result.archived)
+        self.assertFalse(result.unavailable)
+        self.assertEqual(result.conditions["employment"], "Полная занятость")
+        self.assertEqual(result.conditions["work_format"], "Удалённо")
+
+    def test_json_ld_and_listing_fallbacks_fill_structured_fields(self):
+        source = """
+        <h1 data-qa="vacancy-title">HRD</h1>
+        <div data-qa="vacancy-description">Описание</div>
+        <script type="application/ld+json">
+          {"@type":"JobPosting","datePosted":"2026-09-10",
+           "employmentType":"FULL_TIME","jobLocationType":"TELECOMMUTE"}
+        </script>"""
+        result = parse_vacancy_page(source, "https://hh.ru/vacancy/13")
+        self.assertEqual(result.published_at.isoformat(), "2026-09-10T00:00:00+00:00")
+        self.assertEqual(result.field_states["published_at"].source, "json_ld")
+        self.assertEqual(result.conditions["employment"], "Полная занятость")
+        self.assertEqual(result.conditions["work_format"], "Удалённо")
+
+        listing = parse_vacancy_page(
+            '<h1 data-qa="vacancy-title">Lead</h1>'
+            '<div data-qa="vacancy-description">Описание</div>',
+            "https://hh.ru/vacancy/14",
+            fallback_fields={"published_text": "10 сентября 2026"},
+        )
+        self.assertEqual(listing.published_at.isoformat(), "2026-09-10T00:00:00+00:00")
+        self.assertEqual(listing.field_states["published_at"].source, "listing")
+
+    def test_http_terminal_evidence_overrides_page_templates(self):
+        unavailable = parse_vacancy_page(
+            "<main></main>", "https://hh.ru/vacancy/15", http_status=404
+        )
+        self.assertEqual(unavailable.availability, "unavailable")
+        archived = parse_vacancy_page(
+            '<h1 data-qa="vacancy-title">Old</h1>',
+            "https://hh.ru/vacancy/16",
+            availability="archived",
+        )
+        self.assertTrue(archived.archived)
+
+    def test_browser_visible_fields_override_hidden_dom_candidates(self):
+        result = parse_vacancy_page(
+            '<h1 data-qa="vacancy-title">Lead</h1>'
+            '<div data-qa="vacancy-description">Описание</div>'
+            '<div class="css-hidden" data-qa="vacancy-work-format">В офисе</div>',
+            "https://hh.ru/vacancy/18",
+            visible_fields={
+                "conditions": {"work_format": "Удалённая работа"},
+                "published_text": "10 сентября 2026",
+            },
+        )
+        self.assertEqual(result.conditions["work_format"], "Удалённо")
+        self.assertEqual(result.field_states["work_format"].source, "dom")
+        self.assertEqual(result.published_at.isoformat(), "2026-09-10T00:00:00+00:00")
 
 
 if __name__ == "__main__":
