@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -16,7 +16,8 @@ CREATE TABLE IF NOT EXISTS runs(
  stop_reason TEXT, complete INTEGER NOT NULL DEFAULT 0, limit_count INTEGER NOT NULL,
  discovered INTEGER NOT NULL DEFAULT 0, accepted INTEGER NOT NULL DEFAULT 0,
  loaded INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
- progress_json TEXT NOT NULL DEFAULT '{}'
+ progress_json TEXT NOT NULL DEFAULT '{}', vacancy_cache_ttl_hours INTEGER NOT NULL DEFAULT 24,
+ navigation_interval_seconds REAL NOT NULL DEFAULT 1.0
 );
 CREATE TABLE IF NOT EXISTS run_searches(
  run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL, spec_json TEXT NOT NULL,
@@ -72,7 +73,6 @@ class Database:
         con = sqlite3.connect(self.path, timeout=30)
         con.row_factory = sqlite3.Row
         con.execute("PRAGMA foreign_keys=ON")
-        con.execute("PRAGMA journal_mode=WAL")
         return con
 
     @contextmanager
@@ -90,6 +90,7 @@ class Database:
 
     def migrate(self) -> None:
         with self.connect() as con:
+            con.execute("PRAGMA journal_mode=WAL")
             try:
                 row = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
             except sqlite3.OperationalError:
@@ -99,14 +100,26 @@ class Database:
                     f"database schema {row[0]} is newer than supported {SCHEMA_VERSION}"
                 )
             con.executescript(SCHEMA)
-            if not row:
-                con.execute(
-                    "INSERT INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),)
-                )
-            elif int(row[0]) < 2:
-                columns = {item[1] for item in con.execute("PRAGMA table_info(runs)")}
-                if "progress_json" not in columns:
-                    con.execute("ALTER TABLE runs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'")
+            previous = int(row[0]) if row else 0
+            columns = {item[1] for item in con.execute("PRAGMA table_info(runs)")}
+            if previous < 2 and "progress_json" not in columns:
+                con.execute("ALTER TABLE runs ADD COLUMN progress_json TEXT NOT NULL DEFAULT '{}'")
+            if previous < 3:
+                if "vacancy_cache_ttl_hours" not in columns:
+                    con.execute(
+                        "ALTER TABLE runs ADD COLUMN vacancy_cache_ttl_hours "
+                        "INTEGER NOT NULL DEFAULT 24"
+                    )
+                if "navigation_interval_seconds" not in columns:
+                    con.execute(
+                        "ALTER TABLE runs ADD COLUMN navigation_interval_seconds "
+                        "REAL NOT NULL DEFAULT 1.0"
+                    )
+            if row:
                 con.execute(
                     "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)
+                )
+            else:
+                con.execute(
+                    "INSERT INTO meta(key,value) VALUES('schema_version',?)", (str(SCHEMA_VERSION),)
                 )

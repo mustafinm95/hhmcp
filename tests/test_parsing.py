@@ -89,20 +89,30 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(calls, 8)
 
     def test_http_429_uses_retry_path_instead_of_parsing_page(self):
+        delays = []
+
         class Response:
             status = 429
 
             async def all_headers(self):
-                return {"retry-after": "1"}
+                return {"retry-after": "120"}
 
         class Page:
             async def goto(self, *_args, **_kwargs):
                 return Response()
 
-        browser = BrowserAdapter(retries=1)
+        class Limiter:
+            async def wait(self):
+                return None
+
+            async def backoff(self, seconds):
+                delays.append(seconds)
+
+        browser = BrowserAdapter(retries=1, _limiter=Limiter())
         browser._page = Page()
         with self.assertRaisesRegex(PageNotReady, "HTTP 429"):
             asyncio.run(browser.fetch_html("https://hh.ru/vacancy/1", readiness="vacancy"))
+        self.assertEqual(delays, [120.0])
 
     def test_search_parsing_deduplicates_excludes_ads_and_finds_next(self):
         html = """

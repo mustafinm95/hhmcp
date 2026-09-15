@@ -155,6 +155,8 @@ class Run(BaseModel):
     loaded: int = 0
     cached: int = 0
     errors: int = 0
+    vacancy_cache_ttl_hours: int = Field(default=24, ge=0)
+    navigation_interval_seconds: float = Field(default=1.0, ge=1)
     search_specs: list[SearchSpec] = Field(default_factory=list)
     progress: RunProgress = Field(default_factory=RunProgress)
 

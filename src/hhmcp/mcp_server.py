@@ -3,8 +3,8 @@ from __future__ import annotations
 import asyncio
 import atexit
 import json
+import math
 from contextlib import asynccontextmanager
-from datetime import timedelta
 from pathlib import Path
 
 from mcp.server.fastmcp import FastMCP
@@ -24,7 +24,7 @@ reservations: dict[str, CollectorLock] = {}
 
 
 def _mark_unfinished_interrupted() -> None:
-    for run_id, task in tasks.items():
+    for run_id, task in list(tasks.items()):
         if not task.done():
             collector.repo.set_run_state(run_id, "interrupted", "MCP server stopped", False)
             if run_id in reservations:
@@ -65,14 +65,9 @@ async def _run_collection(
     run_id: str,
     refresh: bool,
     lock: CollectorLock,
-    vacancy_cache_ttl_hours: int = 24,
 ) -> None:
     try:
-        await collector._collect_locked(
-            run_id,
-            refresh=refresh,
-            vacancy_cache_ttl=timedelta(hours=vacancy_cache_ttl_hours),
-        )
+        await collector._collect_locked(run_id, refresh=refresh)
     except asyncio.CancelledError:
         if collector.repo.get_run(run_id).state != "cancelled":
             collector.repo.set_run_state(run_id, "interrupted", "MCP server stopped", False)
@@ -87,9 +82,31 @@ async def _run_collection(
         reservations.pop(run_id, None)
 
 
-def _consume_task_result(task: asyncio.Task[None]) -> None:
-    if not task.cancelled():
-        task.exception()
+def _consume_task_result(run_id: str, task: asyncio.Task[None]) -> None:
+    try:
+        if not task.cancelled():
+            task.exception()
+    finally:
+        if tasks.get(run_id) is task:
+            tasks.pop(run_id, None)
+
+
+def _schedule_collection(run_id: str, refresh: bool, lock: CollectorLock) -> None:
+    task = asyncio.create_task(_run_collection(run_id, refresh, lock))
+    tasks[run_id] = task
+    task.add_done_callback(lambda completed: _consume_task_result(run_id, completed))
+
+
+def _validate_collection_settings(
+    vacancy_cache_ttl_hours: int | None,
+    navigation_interval_seconds: float | None,
+) -> None:
+    if vacancy_cache_ttl_hours is not None and vacancy_cache_ttl_hours < 0:
+        raise ValueError("vacancy_cache_ttl_hours must be non-negative")
+    if navigation_interval_seconds is not None and (
+        not math.isfinite(navigation_interval_seconds) or navigation_interval_seconds < 1
+    ):
+        raise ValueError("navigation_interval_seconds must be at least 1")
 
 
 @mcp.tool()
@@ -98,22 +115,28 @@ async def start_collection(
     limit: int = 1000,
     refresh: bool = False,
     vacancy_cache_ttl_hours: int = 24,
+    navigation_interval_seconds: float = 1.0,
 ) -> dict:
-    """Start a background collection and immediately return its run id."""
-    if vacancy_cache_ttl_hours < 0:
-        raise ValueError("vacancy_cache_ttl_hours must be non-negative")
+    """Start a background collection and immediately return its run id.
+
+    ``vacancy_cache_ttl_hours=0`` disables detail reuse. Navigation starts are
+    globally spaced by at least ``navigation_interval_seconds`` (minimum 1).
+    """
+    _validate_collection_settings(vacancy_cache_ttl_hours, navigation_interval_seconds)
     specs = [SearchSpec.model_validate(x) for x in searches]
     lock = _reserve_collector()
     try:
-        run_id = collector.start(specs, limit)
+        run_id = collector.start(
+            specs,
+            limit,
+            vacancy_cache_ttl_hours=vacancy_cache_ttl_hours,
+            navigation_interval_seconds=navigation_interval_seconds,
+        )
     except Exception:
         lock.release()
         raise
     reservations[run_id] = lock
-    tasks[run_id] = asyncio.create_task(
-        _run_collection(run_id, refresh, lock, vacancy_cache_ttl_hours)
-    )
-    tasks[run_id].add_done_callback(_consume_task_result)
+    _schedule_collection(run_id, refresh, lock)
     await asyncio.sleep(0)
     return {"run_id": run_id, "state": "queued"}
 
@@ -137,20 +160,27 @@ async def cancel_collection(run_id: str) -> dict:
 async def resume_collection(
     run_id: str,
     refresh: bool = False,
-    vacancy_cache_ttl_hours: int = 24,
+    vacancy_cache_ttl_hours: int | None = None,
+    navigation_interval_seconds: float | None = None,
 ) -> dict:
-    if vacancy_cache_ttl_hours < 0:
-        raise ValueError("vacancy_cache_ttl_hours must be non-negative")
+    """Resume an incomplete run, optionally replacing its persisted collection settings."""
+    _validate_collection_settings(vacancy_cache_ttl_hours, navigation_interval_seconds)
     run = collector.repo.get_run(run_id)
     if run.state == "completed" and run.complete:
         raise ValueError(f"run cannot be resumed from {run.state}")
     lock = _reserve_collector()
-    collector.cancelled.discard(run_id)
+    try:
+        collector.repo.update_run_settings(
+            run_id,
+            vacancy_cache_ttl_hours=vacancy_cache_ttl_hours,
+            navigation_interval_seconds=navigation_interval_seconds,
+        )
+        collector.cancelled.discard(run_id)
+    except Exception:
+        lock.release()
+        raise
     reservations[run_id] = lock
-    tasks[run_id] = asyncio.create_task(
-        _run_collection(run_id, refresh, lock, vacancy_cache_ttl_hours)
-    )
-    tasks[run_id].add_done_callback(_consume_task_result)
+    _schedule_collection(run_id, refresh, lock)
     await asyncio.sleep(0)
     return {"run_id": run_id, "state": "queued"}
 
@@ -284,25 +314,31 @@ async def run_saved_searches(
     limit: int = 1000,
     refresh: bool = False,
     vacancy_cache_ttl_hours: int = 24,
+    navigation_interval_seconds: float = 1.0,
 ) -> dict:
-    if vacancy_cache_ttl_hours < 0:
-        raise ValueError("vacancy_cache_ttl_hours must be non-negative")
-    lock = _reserve_collector()
+    """Run saved searches with persisted cache and navigation settings."""
+    _validate_collection_settings(vacancy_cache_ttl_hours, navigation_interval_seconds)
     with collector.repo.db.connect() as con:
         rows = [
             con.execute("SELECT spec_json FROM saved_searches WHERE name=?", (name,)).fetchone()
             for name in names
         ]
     if any(row is None for row in rows):
-        lock.release()
         raise KeyError("saved search not found")
     specs = [SearchSpec.model_validate_json(row[0]) for row in rows if row]
-    run_id = collector.start(specs, limit)
+    lock = _reserve_collector()
+    try:
+        run_id = collector.start(
+            specs,
+            limit,
+            vacancy_cache_ttl_hours=vacancy_cache_ttl_hours,
+            navigation_interval_seconds=navigation_interval_seconds,
+        )
+    except Exception:
+        lock.release()
+        raise
     reservations[run_id] = lock
-    tasks[run_id] = asyncio.create_task(
-        _run_collection(run_id, refresh, lock, vacancy_cache_ttl_hours)
-    )
-    tasks[run_id].add_done_callback(_consume_task_result)
+    _schedule_collection(run_id, refresh, lock)
     await asyncio.sleep(0)
     return {"run_id": run_id, "state": "queued"}
 
@@ -332,8 +368,8 @@ def rank_vacancy(vacancy_id: str, profile_id: str) -> dict:
 
 
 @mcp.tool()
-def vacancy_history(vacancy_id: str) -> list[dict]:
-    return collector.repo.history(vacancy_id)
+def vacancy_history(vacancy_id: str, limit: int = 20, offset: int = 0) -> list[dict]:
+    return collector.repo.history(vacancy_id, limit=limit, offset=offset)
 
 
 @mcp.tool()
@@ -342,32 +378,35 @@ def compare_runs(current_run_id: str, previous_run_id: str) -> dict:
 
 
 @mcp.tool()
-def similar_vacancies(vacancy_id: str, threshold: float = 0.72) -> list[dict]:
-    return collector.repo.find_similar(vacancy_id, threshold)
+async def similar_vacancies(vacancy_id: str, threshold: float = 0.72) -> list[dict]:
+    return await asyncio.to_thread(collector.repo.find_similar, vacancy_id, threshold)
 
 
 @mcp.tool()
-def library_stats(
+async def library_stats(
     query: str | None = None,
     status: str | None = None,
     tags: list[str] | None = None,
     employer_id: str | None = None,
     work_format: str | None = None,
 ) -> dict:
-    return calculate(
-        collector.repo.list_vacancies(
-            query=query,
-            status=status,
-            tags=tags,
-            employer_id=employer_id,
-            work_format=work_format,
-            limit=None,
+    def load() -> dict:
+        return calculate(
+            collector.repo.list_vacancies(
+                query=query,
+                status=status,
+                tags=tags,
+                employer_id=employer_id,
+                work_format=work_format,
+                limit=None,
+            )
         )
-    )
+
+    return await asyncio.to_thread(load)
 
 
 @mcp.tool()
-def export_library(
+async def export_library(
     path: str,
     format: str = "json",
     query: str | None = None,
@@ -377,16 +416,21 @@ def export_library(
     work_format: str | None = None,
 ) -> dict:
     destination = Path(path).resolve()
-    rows = collector.repo.list_vacancies(
-        query=query,
-        status=status,
-        tags=tags,
-        employer_id=employer_id,
-        work_format=work_format,
-        limit=None,
-    )
-    export_rows(rows, destination, format)
-    return {"path": str(destination), "count": len(rows)}
+
+    def export() -> int:
+        rows = collector.repo.list_vacancies(
+            query=query,
+            status=status,
+            tags=tags,
+            employer_id=employer_id,
+            work_format=work_format,
+            limit=None,
+        )
+        export_rows(rows, destination, format)
+        return len(rows)
+
+    count = await asyncio.to_thread(export)
+    return {"path": str(destination), "count": count}
 
 
 def main() -> None:

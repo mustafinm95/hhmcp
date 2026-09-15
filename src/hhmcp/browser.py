@@ -31,9 +31,13 @@ class NavigationLimiter:
         self._lock = asyncio.Lock()
 
     async def wait(self) -> None:
-        async with self._lock:
-            await asyncio.sleep(max(0.0, self._next_start - time.monotonic()))
-            self._next_start = time.monotonic() + self.interval
+        while True:
+            async with self._lock:
+                delay = self._next_start - time.monotonic()
+                if delay <= 0:
+                    self._next_start = time.monotonic() + self.interval
+                    return
+            await asyncio.sleep(delay)
 
     async def backoff(self, seconds: float) -> None:
         async with self._lock:
@@ -85,7 +89,7 @@ class BrowserAdapter:
         self,
         *,
         headless: bool = True,
-        min_delay: float = 2.0,
+        min_delay: float = 1.0,
         retries: int = 3,
         timeout_ms: int = 30_000,
         profile_dir: str | Path | None = None,
@@ -196,7 +200,7 @@ class BrowserAdapter:
                                     0.0,
                                     parsedate_to_datetime(retry_after).timestamp() - time.time(),
                                 )
-                    await self._limiter.backoff(min(max(delay, 1.0), 30.0))
+                    await self._limiter.backoff(max(delay, 1.0))
                     raise PageNotReady(f"HH returned HTTP {self.last_status}")
                 await self._raise_if_blocked()
                 if self.last_status not in {404, 410}:
@@ -216,78 +220,6 @@ class BrowserAdapter:
                 if attempt + 1 < self.retries:
                     await asyncio.sleep(2**attempt)
         raise PageNotReady(f"page failed after {self.retries} attempts: {error}") from error
-
-    async def apply_structured_filters(
-        self, filters: dict[str, str | list[str]]
-    ) -> tuple[SearchPage, str]:
-        """Apply filters through controls present in HH's search form.
-
-        Values are never translated into undocumented query constants.  A missing
-        control is an explicit error, and the resulting page still reports URL
-        parameters that could not be confirmed from checked UI controls.
-        """
-        if self._page is None:
-            raise RuntimeError("BrowserAdapter must be used as an async context manager")
-        await self._pace()
-        await self._page.goto(
-            "https://hh.ru/search/vacancy",
-            wait_until="domcontentloaded",
-            timeout=self.timeout_ms,
-        )
-        await self._raise_if_blocked()
-        verified: dict[str, list[str]] = {}
-        text_value = filters.pop("text", None)
-        if text_value is not None:
-            search_input = self._page.locator('[data-qa="search-input"], input[name="text"]')
-            if not await search_input.count():
-                raise ValueError("filter is unavailable in HH UI: text")
-            await search_input.first.fill(str(text_value))
-            verified["text"] = [str(text_value)]
-        drawer = self._page.locator('[data-qa="header-search-filters-button"]')
-        if filters:
-            if not await drawer.count():
-                raise ValueError("HH UI has no filters panel")
-            await drawer.click()
-        aliases = {
-            "employment": "employment_form",
-            "schedule": "work_schedule_by_days",
-        }
-        for name, raw_values in filters.items():
-            values = raw_values if isinstance(raw_values, list) else [raw_values]
-            for value in values:
-                actual_name = aliases.get(name, name)
-                escaped_name = actual_name.replace('"', '\\"')
-                escaped_value = str(value).replace('"', '\\"')
-                control = self._page.locator(
-                    f'input[name="{escaped_name}"][value="{escaped_value}"]'
-                )
-                if not await control.count() and name == "salary":
-                    control = self._page.locator('[data-qa="search-filter-compensation-input"]')
-                if not await control.count() and name == "excluded_text":
-                    control = self._page.locator('[data-qa="filter-select-excluded_text"]')
-                if not await control.count():
-                    raise ValueError(f"filter is unavailable in HH UI: {name}={value}")
-                kind = await control.first.get_attribute("type")
-                if kind in {"checkbox", "radio"}:
-                    await control.first.check()
-                else:
-                    await control.first.fill(str(value))
-                verified.setdefault(name, []).append(str(value))
-        submit = self._page.locator(
-            '[data-qa="search-drawer-filters-submit"]' if filters else '[data-qa="search-button"]'
-        )
-        if not await submit.count():
-            raise PageNotReady("HH search form has no submit control")
-        await submit.first.click()
-        await self._page.wait_for_load_state("domcontentloaded", timeout=self.timeout_ms)
-        await self._wait_ready("search")
-        source = await self._page.content()
-        parsed = parse_search_page(source, self._page.url)
-        parsed.applied_filters.update(verified)
-        parsed.unchecked_parameters = [
-            name for name in parsed.unchecked_parameters if name not in verified
-        ]
-        return parsed, self._page.url
 
     async def _raise_if_blocked(self) -> None:
         if await self._is_blocked():

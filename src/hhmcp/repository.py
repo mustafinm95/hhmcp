@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import re
 import sqlite3
 import uuid
@@ -63,14 +64,36 @@ class Repository:
     def __init__(self, db: Database):
         self.db = db
 
-    def create_run(self, specs: list[SearchSpec], limit: int = 1000) -> Run:
+    def create_run(
+        self,
+        specs: list[SearchSpec],
+        limit: int = 1000,
+        *,
+        vacancy_cache_ttl_hours: int = 24,
+        navigation_interval_seconds: float = 1.0,
+    ) -> Run:
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
+        if vacancy_cache_ttl_hours < 0:
+            raise ValueError("vacancy_cache_ttl_hours must be non-negative")
+        if not math.isfinite(navigation_interval_seconds) or navigation_interval_seconds < 1:
+            raise ValueError("navigation_interval_seconds must be at least 1")
         run_id, now = str(uuid.uuid4()), utcnow()
         with self.db.transaction() as con:
             con.execute(
-                "INSERT INTO runs(id,state,created_at,updated_at,limit_count) VALUES(?,?,?,?,?)",
-                (run_id, "queued", now, now, limit),
+                """INSERT INTO runs(
+                   id,state,created_at,updated_at,limit_count,
+                   vacancy_cache_ttl_hours,navigation_interval_seconds
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    run_id,
+                    "queued",
+                    now,
+                    now,
+                    limit,
+                    vacancy_cache_ttl_hours,
+                    navigation_interval_seconds,
+                ),
             )
             for pos, spec in enumerate(specs):
                 con.execute(
@@ -103,9 +126,39 @@ class Repository:
             loaded=row["loaded"],
             cached=row["cached"],
             errors=row["errors"],
+            vacancy_cache_ttl_hours=row["vacancy_cache_ttl_hours"],
+            navigation_interval_seconds=row["navigation_interval_seconds"],
             search_specs=specs,
             progress=RunProgress.model_validate_json(row["progress_json"] or "{}"),
         )
+
+    def update_run_settings(
+        self,
+        run_id: str,
+        *,
+        vacancy_cache_ttl_hours: int | None = None,
+        navigation_interval_seconds: float | None = None,
+    ) -> None:
+        values = {
+            "vacancy_cache_ttl_hours": vacancy_cache_ttl_hours,
+            "navigation_interval_seconds": navigation_interval_seconds,
+        }
+        values = {key: value for key, value in values.items() if value is not None}
+        if not values:
+            return
+        if vacancy_cache_ttl_hours is not None and vacancy_cache_ttl_hours < 0:
+            raise ValueError("vacancy_cache_ttl_hours must be non-negative")
+        if navigation_interval_seconds is not None and (
+            not math.isfinite(navigation_interval_seconds) or navigation_interval_seconds < 1
+        ):
+            raise ValueError("navigation_interval_seconds must be at least 1")
+        with self.db.transaction() as con:
+            cursor = con.execute(
+                f"UPDATE runs SET {','.join(f'{key}=?' for key in values)},updated_at=? WHERE id=?",
+                (*values.values(), utcnow(), run_id),
+            )
+            if not cursor.rowcount:
+                raise KeyError(run_id)
 
     def set_progress(self, run_id: str, progress: RunProgress) -> None:
         with self.db.transaction() as con:
@@ -167,10 +220,6 @@ class Repository:
                 "SELECT 1 FROM run_vacancies WHERE run_id=? AND vacancy_id=?",
                 (run_id, vacancy_id),
             ).fetchone()
-            globally_discovered = con.execute(
-                "SELECT 1 FROM run_vacancies WHERE run_id=? AND vacancy_id=?",
-                (run_id, vacancy_id),
-            ).fetchone()
             accepted = con.execute("SELECT accepted FROM runs WHERE id=?", (run_id,)).fetchone()[0]
             globally_accepted = con.execute(
                 "SELECT 1 FROM run_vacancies WHERE run_id=? AND vacancy_id=? AND accepted=1",
@@ -202,9 +251,117 @@ class Repository:
             con.execute(
                 """UPDATE runs SET discovered=discovered+?,accepted=accepted+?,updated_at=?
                    WHERE id=?""",
-                (int(not globally_discovered), int(take), utcnow(), run_id),
+                (int(not existed), int(take), utcnow(), run_id),
             )
             return not bool(existed), take, rejected_by_limit
+
+    def record_page_observations(
+        self,
+        run_id: str,
+        pos: int,
+        observations: list[dict[str, Any]],
+        limit: int,
+        *,
+        cache_cutoff: str | None,
+        parser_version: str,
+        checkpoint_url: str,
+        applied_filters: dict[str, Any],
+        complete: bool,
+    ) -> list[dict[str, Any]]:
+        """Record one search page and return only jobs that require detail loading."""
+        results: list[dict[str, Any]] = []
+        with self.db.transaction() as con:
+            accepted_count = con.execute(
+                "SELECT accepted FROM runs WHERE id=?", (run_id,)
+            ).fetchone()[0]
+            discovered_delta = accepted_delta = cached_delta = 0
+            for observation in observations:
+                if accepted_count >= limit:
+                    break
+                vacancy_id = observation["vacancy_id"]
+                previous = con.execute(
+                    """SELECT accepted,outcome FROM run_vacancies
+                       WHERE run_id=? AND vacancy_id=? ORDER BY accepted DESC""",
+                    (run_id, vacancy_id),
+                ).fetchall()
+                discovered = not previous
+                already_accepted = any(bool(row["accepted"]) for row in previous)
+                accepted = not already_accepted
+                previous_outcome = next(
+                    (row["outcome"] for row in previous if row["outcome"] is not None), None
+                )
+                cached = False
+                if accepted and cache_cutoff is not None:
+                    cached = bool(
+                        con.execute(
+                            """SELECT 1 FROM vacancies
+                               WHERE hh_id=? AND julianday(fetched_at)>=julianday(?)
+                               AND parser_version=?""",
+                            (vacancy_id, cache_cutoff, parser_version),
+                        ).fetchone()
+                    )
+                outcome = "cached" if cached else previous_outcome
+                con.execute(
+                    """INSERT OR IGNORE INTO run_vacancies
+                       (run_id,search_position,vacancy_id,discovered_at,accepted,outcome)
+                       VALUES(?,?,?,?,?,?)""",
+                    (run_id, pos, vacancy_id, utcnow(), int(accepted), outcome),
+                )
+                job = None
+                if accepted:
+                    accepted_count += 1
+                    accepted_delta += 1
+                    if cached:
+                        cached_delta += 1
+                        con.execute(
+                            "UPDATE run_vacancies SET outcome='cached' WHERE run_id=? AND vacancy_id=?",
+                            (run_id, vacancy_id),
+                        )
+                    else:
+                        payload = canonical(
+                            {
+                                "url": observation["url"],
+                                "observed": observation.get("observed") or {},
+                            }
+                        )
+                        con.execute(
+                            """INSERT OR IGNORE INTO jobs(run_id,kind,target,payload_json)
+                               VALUES(?,?,?,?)""",
+                            (run_id, "vacancy", vacancy_id, payload),
+                        )
+                        row = con.execute(
+                            """SELECT * FROM jobs
+                               WHERE run_id=? AND kind='vacancy' AND target=?""",
+                            (run_id, vacancy_id),
+                        ).fetchone()
+                        job = dict(row)
+                discovered_delta += int(discovered)
+                results.append(
+                    {
+                        "vacancy_id": vacancy_id,
+                        "discovered": discovered,
+                        "accepted": accepted,
+                        "cached": cached,
+                        "job": job,
+                    }
+                )
+            con.execute(
+                """UPDATE runs SET discovered=discovered+?,accepted=accepted+?,cached=cached+?,
+                   updated_at=? WHERE id=?""",
+                (discovered_delta, accepted_delta, cached_delta, utcnow(), run_id),
+            )
+            con.execute(
+                """UPDATE run_searches SET final_url=?,applied_filters_json=?,complete=?
+                   WHERE run_id=? AND position=?""",
+                (
+                    checkpoint_url,
+                    canonical(applied_filters),
+                    int(complete and len(results) == len(observations)),
+                    run_id,
+                    pos,
+                ),
+            )
+        return results
 
     def pending_jobs(self, run_id: str) -> list[sqlite3.Row]:
         with self.db.connect() as con:
@@ -315,17 +472,22 @@ class Repository:
                     "INSERT INTO vacancy_versions(vacancy_id,observed_at,parser_version,content_hash,data_json,baseline) VALUES(?,?,?,?,?,?)",
                     (vacancy.hh_id, now, vacancy.parser_version, h, raw, baseline),
                 )
-            con.execute("DELETE FROM vacancy_fts WHERE vacancy_id=?", (vacancy.hh_id,))
-            con.execute(
-                "INSERT INTO vacancy_fts VALUES(?,?,?,?,?)",
-                (
-                    vacancy.hh_id,
-                    vacancy.title or "",
-                    vacancy.description or "",
-                    vacancy.employer_name or "",
-                    " ".join(vacancy.skills),
-                ),
-            )
+            if changed:
+                con.execute("DELETE FROM vacancy_fts WHERE vacancy_id=?", (vacancy.hh_id,))
+                con.execute(
+                    "INSERT INTO vacancy_fts VALUES(?,?,?,?,?)",
+                    (
+                        vacancy.hh_id,
+                        vacancy.title or "",
+                        vacancy.description or "",
+                        vacancy.employer_name or "",
+                        " ".join(vacancy.skills),
+                    ),
+                )
+                con.execute(
+                    "DELETE FROM similar_vacancies WHERE a=? OR b=?",
+                    (vacancy.hh_id, vacancy.hh_id),
+                )
             if job_id is not None:
                 job = con.execute(
                     "SELECT run_id,target,state FROM jobs WHERE id=?", (job_id,)
@@ -443,7 +605,8 @@ class Repository:
     def run_results(self, run_id: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         with self.db.connect() as con:
             rows = con.execute(
-                """SELECT v.data_json,rv.outcome,MIN(rv.discovered_at) discovered_at
+                """SELECT v.data_json,MAX(rv.outcome) outcome,
+                          MIN(rv.discovered_at) discovered_at
                    FROM run_vacancies rv LEFT JOIN vacancies v ON v.hh_id=rv.vacancy_id
                    WHERE rv.run_id=? GROUP BY rv.vacancy_id
                    ORDER BY discovered_at LIMIT ? OFFSET ?""",
@@ -467,13 +630,18 @@ class Repository:
                 (employer.hh_id, raw, utcnow(), h),
             )
 
-    def history(self, vacancy_id: str) -> list[dict]:
+    def history(self, vacancy_id: str, limit: int = 20, offset: int = 0) -> list[dict]:
+        if not 1 <= limit <= 1000:
+            raise ValueError("limit must be between 1 and 1000")
+        if offset < 0:
+            raise ValueError("offset must be non-negative")
         with self.db.connect() as con:
             return [
                 dict(r) | {"data": json.loads(r["data_json"])}
                 for r in con.execute(
-                    "SELECT * FROM vacancy_versions WHERE vacancy_id=? ORDER BY observed_at",
-                    (vacancy_id,),
+                    """SELECT * FROM vacancy_versions WHERE vacancy_id=?
+                       ORDER BY observed_at LIMIT ? OFFSET ?""",
+                    (vacancy_id, limit, offset),
                 )
             ]
 
@@ -548,6 +716,7 @@ class Repository:
         vacancy, _ = self.get_vacancy(vacancy_id)
         needle = f"{vacancy.title or ''} {vacancy.employer_name or ''} {vacancy.description or ''}".casefold()
         matches = []
+        stored = []
         for row in self.list_vacancies(limit=1000):
             if row["hh_id"] == vacancy_id:
                 continue
@@ -555,9 +724,11 @@ class Repository:
             score = SequenceMatcher(None, needle, candidate).ratio()
             if score >= threshold:
                 a, b = sorted((vacancy_id, row["hh_id"]))
-                with self.db.transaction() as con:
-                    con.execute(
-                        "INSERT OR REPLACE INTO similar_vacancies VALUES(?,?,?)", (a, b, score)
-                    )
+                stored.append((a, b, score))
                 matches.append({"vacancy_id": row["hh_id"], "score": round(score, 3)})
+        if stored:
+            with self.db.transaction() as con:
+                con.executemany(
+                    "INSERT OR REPLACE INTO similar_vacancies VALUES(?,?,?)", stored
+                )
         return sorted(matches, key=lambda x: -x["score"])

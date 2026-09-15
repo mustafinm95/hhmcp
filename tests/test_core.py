@@ -121,6 +121,21 @@ def test_run_comparison_requires_same_normalized_query_and_reports_uncertainty(t
         repo.compare_runs(c.id, a.id)
 
 
+def test_run_results_preserve_outcome_across_duplicate_search_memberships(tmp_path):
+    repo = Repository(Database(tmp_path / "db.sqlite"))
+    run = repo.create_run([SearchSpec(text="python"), SearchSpec(text="developer")])
+    repo.save_vacancy_and_finish_job(vacancy())
+    repo.observe(run.id, 0, "1", True)
+    repo.observe(run.id, 1, "1", False)
+    with repo.db.transaction() as con:
+        con.execute(
+            "UPDATE run_vacancies SET outcome='cached' WHERE run_id=? AND search_position=0",
+            (run.id,),
+        )
+
+    assert repo.run_results(run.id)[0]["outcome"] == "cached"
+
+
 def _hold_lock(path: str, ready):
     with CollectorLock(Path(path)):
         ready.set()
@@ -170,7 +185,36 @@ def test_version_one_database_is_migrated_with_progress(tmp_path):
         columns = {row[1] for row in con.execute("PRAGMA table_info(runs)")}
         version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
     assert "progress_json" in columns
-    assert version == "2"
+    assert "vacancy_cache_ttl_hours" in columns
+    assert "navigation_interval_seconds" in columns
+    assert version == "3"
+
+
+def test_version_two_database_is_migrated_with_collection_settings(tmp_path):
+    path = tmp_path / "v2.sqlite"
+    with sqlite3.connect(path) as con:
+        con.executescript(
+            """
+            CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+            INSERT INTO meta VALUES('schema_version', '2');
+            CREATE TABLE runs(
+              id TEXT PRIMARY KEY, state TEXT NOT NULL, created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL, stop_reason TEXT, complete INTEGER NOT NULL DEFAULT 0,
+              limit_count INTEGER NOT NULL, discovered INTEGER NOT NULL DEFAULT 0,
+              accepted INTEGER NOT NULL DEFAULT 0, loaded INTEGER NOT NULL DEFAULT 0,
+              cached INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
+              progress_json TEXT NOT NULL DEFAULT '{}'
+            );
+            """
+        )
+
+    db = Database(path)
+
+    with db.connect() as con:
+        columns = {row[1] for row in con.execute("PRAGMA table_info(runs)")}
+        version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+    assert {"vacancy_cache_ttl_hours", "navigation_interval_seconds"} <= columns
+    assert version == "3"
 
 
 def test_csv_formula_protection_and_unicode(tmp_path):
@@ -220,7 +264,9 @@ async def test_batch_limit_dedup_and_error_consumes_slot(tmp_path, monkeypatch):
             url = filters["text"]
             return pages[url][0], url
 
-    async def fake_load(self, browser, vacancy_id, url, refresh, job_id=None, cache_ttl=None):
+    async def fake_load(
+        self, browser, vacancy_id, url, refresh, job_id=None, cache_ttl=None, observed=None
+    ):
         if vacancy_id == "2":
             raise ValueError("broken fixture")
         self.repo.save_vacancy_and_finish_job(vacancy(vacancy_id), job_id)
@@ -258,7 +304,7 @@ async def test_mcp_explicit_cancel_stays_cancelled(tmp_path, monkeypatch):
     run_id = local.start([SearchSpec(text="python")])
     blocker = asyncio.Event()
 
-    async def wait_forever(_run_id, *, refresh, vacancy_cache_ttl):
+    async def wait_forever(_run_id, *, refresh):
         await blocker.wait()
 
     monkeypatch.setattr(server, "collector", local)

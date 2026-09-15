@@ -75,8 +75,20 @@ class Collector:
         self.headless = headless
         self.cancelled: set[str] = set()
 
-    def start(self, specs: list[SearchSpec], limit: int = 1000) -> str:
-        return self.repo.create_run(specs, limit).id
+    def start(
+        self,
+        specs: list[SearchSpec],
+        limit: int = 1000,
+        *,
+        vacancy_cache_ttl_hours: int = 24,
+        navigation_interval_seconds: float = 1.0,
+    ) -> str:
+        return self.repo.create_run(
+            specs,
+            limit,
+            vacancy_cache_ttl_hours=vacancy_cache_ttl_hours,
+            navigation_interval_seconds=navigation_interval_seconds,
+        ).id
 
     def cancel(self, run_id: str) -> None:
         self.cancelled.add(run_id)
@@ -95,13 +107,17 @@ class Collector:
         run_id: str,
         *,
         refresh: bool = False,
-        vacancy_cache_ttl: timedelta = DETAIL_TTL,
+        vacancy_cache_ttl: timedelta | None = None,
+        navigation_interval_seconds: float | None = None,
     ) -> None:
         lock = CollectorLock(self.data_dir / "collector.lock")
         try:
             with lock:
                 await self._collect_locked(
-                    run_id, refresh=refresh, vacancy_cache_ttl=vacancy_cache_ttl
+                    run_id,
+                    refresh=refresh,
+                    vacancy_cache_ttl=vacancy_cache_ttl,
+                    navigation_interval_seconds=navigation_interval_seconds,
                 )
         except Exception as exc:
             if self.repo.get_run(run_id).state not in ("paused", "cancelled"):
@@ -114,9 +130,17 @@ class Collector:
         run_id: str,
         *,
         refresh: bool,
-        vacancy_cache_ttl: timedelta = DETAIL_TTL,
+        vacancy_cache_ttl: timedelta | None = None,
+        navigation_interval_seconds: float | None = None,
     ) -> None:
         run = self.repo.get_run(run_id)
+        if vacancy_cache_ttl is None:
+            vacancy_cache_ttl = timedelta(hours=run.vacancy_cache_ttl_hours)
+        navigation_interval_seconds = (
+            run.navigation_interval_seconds
+            if navigation_interval_seconds is None
+            else navigation_interval_seconds
+        )
         self.repo.set_run_state(run_id, "running")
         with self.repo.db.transaction() as con:
             con.execute(
@@ -159,7 +183,7 @@ class Collector:
             nonlocal last_progress_write
             async with progress_lock:
                 progress.pending_details = queue.qsize()
-                if not force and time.monotonic() - last_progress_write < 0.25:
+                if not force and time.monotonic() - last_progress_write < 1.0:
                     return
                 self.repo.set_progress(run_id, progress)
                 last_progress_write = time.monotonic()
@@ -170,7 +194,9 @@ class Collector:
         accepted_count = run.accepted
         limit_reached = accepted_count >= run.limit
         async with BrowserAdapter(
-            headless=self.headless, profile_dir=self.data_dir / "browser-profile"
+            headless=self.headless,
+            profile_dir=self.data_dir / "browser-profile",
+            min_delay=navigation_interval_seconds,
         ) as browser:
             worker_browsers = []
             if hasattr(browser, "new_page_adapter"):
@@ -223,14 +249,12 @@ class Collector:
                 for job in self.repo.pending_jobs(run_id):
                     await queue.put(job)
                 await save_progress()
-                for pos, (url, spec, checkpoint) in enumerate(
+                for pos, (url, _spec, checkpoint) in enumerate(
                     zip(urls, run.search_specs, checkpoints, strict=True)
                 ):
                     if checkpoint["complete"]:
                         continue
-                    page_iters[pos] = self._iter_search(
-                        browser, spec, url, bool(checkpoint["final_url"])
-                    ).__aiter__()
+                    page_iters[pos] = browser.iter_search_pages(url).__aiter__()
                 active = list(page_iters)
                 while active and not limit_reached and not stop_workers.is_set():
                     for pos in list(active):
@@ -276,45 +300,55 @@ class Collector:
                             )
                             stop_workers.set()
                             break
-                        with self.repo.db.transaction() as con:
-                            con.execute(
-                                "UPDATE run_searches SET final_url=?,applied_filters_json=? WHERE run_id=? AND position=?",
-                                (
-                                    final_url,
-                                    json.dumps(
-                                        {
-                                            "applied": page.applied_filters,
-                                            "unchecked": page.unchecked_parameters,
-                                        }
-                                    ),
-                                    run_id,
-                                    pos,
-                                ),
-                            )
-                        for item in page.items:
-                            discovered, accepted, _ = self.repo.record_observation(
-                                run_id,
-                                pos,
-                                item.hh_id,
-                                item.url,
-                                run.limit,
-                                {
+                        observations = [
+                            {
+                                "vacancy_id": item.hh_id,
+                                "url": item.url,
+                                "observed": {
                                     "title": item.title,
                                     "employer_name": item.employer_name,
                                     "salary_text": item.salary_text,
                                     "published_text": item.published_text,
                                     "conditions": item.conditions,
                                 },
-                            )
-                            if discovered:
+                            }
+                            for item in page.items
+                        ]
+                        page_complete = page.next_url is None
+                        checkpoint_url = page.next_url if page.next_url and not page_complete else final_url
+                        results = self.repo.record_page_observations(
+                            run_id,
+                            pos,
+                            observations,
+                            run.limit,
+                            cache_cutoff=(
+                                None
+                                if refresh
+                                else (datetime.now(UTC) - vacancy_cache_ttl).isoformat()
+                            ),
+                            parser_version=PARSER_VERSION,
+                            checkpoint_url=checkpoint_url,
+                            applied_filters={
+                                "applied": page.applied_filters,
+                                "unchecked": page.unchecked_parameters,
+                            },
+                            complete=page_complete,
+                        )
+                        page_complete = page_complete and len(results) == len(observations)
+                        for result in results:
+                            if result["discovered"]:
                                 searches[pos].discovered += 1
-                            if accepted:
+                            if result["accepted"]:
                                 accepted_count += 1
-                                await queue.put(self.repo.get_job(run_id, item.hh_id))
+                            if result["job"] is not None:
+                                await queue.put(result["job"])
                             if accepted_count >= run.limit:
                                 limit_reached = True
                                 break
-                        if page.next_url and not limit_reached:
+                        if page_complete:
+                            searches[pos].complete = True
+                            active.remove(pos)
+                        elif page.next_url and not limit_reached:
                             searches[pos].url = page.next_url
                             searches[pos].page = (
                                 int(
@@ -376,10 +410,6 @@ class Collector:
                     if worker_browser is not browser and hasattr(worker_browser, "close_page"):
                         await worker_browser.close_page()
 
-    async def _iter_search(self, browser, spec: SearchSpec, url: str, resumed: bool):
-        async for value in browser.iter_search_pages(url):
-            yield value
-
     async def _process_job(
         self,
         browser,
@@ -389,6 +419,7 @@ class Collector:
         vacancy_cache_ttl: timedelta = DETAIL_TTL,
     ) -> bool:
         payload = json.loads(job["payload_json"])
+        observed = payload.get("observed")
         self.repo.start_job(job["id"])
         try:
             _, from_cache = await self._load_vacancy(
@@ -398,6 +429,7 @@ class Collector:
                 refresh,
                 job["id"],
                 vacancy_cache_ttl,
+                observed,
             )
             if from_cache:
                 self.repo.finish_job(job["id"], "cached")
@@ -418,6 +450,7 @@ class Collector:
         refresh: bool,
         job_id: int | None = None,
         cache_ttl: timedelta = DETAIL_TTL,
+        observed: dict | None = None,
     ):
         if not refresh:
             try:
@@ -429,12 +462,6 @@ class Collector:
             except KeyError:
                 pass
         source, final_url = await browser.fetch_html(url, readiness="vacancy")
-        observed = None
-        if job_id is not None:
-            with self.repo.db.connect() as con:
-                row = con.execute("SELECT payload_json FROM jobs WHERE id=?", (job_id,)).fetchone()
-            if row:
-                observed = json.loads(row[0]).get("observed")
         browser_availability = getattr(browser, "last_availability", None)
         if f"/vacancy/{vacancy_id}" not in final_url:
             browser_availability = "unavailable"
