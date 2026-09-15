@@ -320,24 +320,18 @@ def _conditions_from_text(text: str) -> dict[str, str]:
     return result
 
 
-def _published_at(root: _Node) -> datetime | None:
-    node = _first(
-        root,
-        "vacancy-creation-time",
-        "vacancy-creation-time-redesigned",
-        "vacancy-view-creation-time",
-    )
-    raw = (node.attrs.get("datetime") or node.attrs.get("content")) if node else None
+def parse_published_at(raw: str | None, *, now: datetime | None = None) -> datetime | None:
+    """Parse an HH publication timestamp or localized listing label."""
     if raw:
         try:
             value = datetime.fromisoformat(raw.replace("Z", "+00:00"))
             return value if value.tzinfo else value.replace(tzinfo=UTC)
         except ValueError:
             pass
-    if not node:
+    if not raw:
         return None
-    text = node.text.casefold()
-    now = datetime.now(UTC)
+    text = raw.casefold()
+    now = now or datetime.now(UTC)
     if "сегодня" in text:
         return now.replace(hour=0, minute=0, second=0, microsecond=0)
     if "вчера" in text:
@@ -362,9 +356,22 @@ def _published_at(root: _Node) -> datetime | None:
             int(match.group(3) or now.year),
             months[match.group(2)],
             int(match.group(1)),
-            tzinfo=UTC,
+            tzinfo=now.tzinfo or UTC,
         )
     return None
+
+
+def _published_at(root: _Node) -> datetime | None:
+    node = _first(
+        root,
+        "vacancy-creation-time",
+        "vacancy-creation-time-redesigned",
+        "vacancy-view-creation-time",
+    )
+    if not node:
+        return None
+    raw = node.attrs.get("datetime") or node.attrs.get("content") or node.text
+    return parse_published_at(raw)
 
 
 def parse_salary(text: str | None) -> ParsedSalary | None:
@@ -445,9 +452,7 @@ def parse_search_page(source: str, base_url: str) -> SearchPage:
         salary = _first(
             context, "vacancy-serp__vacancy-compensation", "vacancy-serp__vacancy-salary"
         )
-        published = _first(
-            context, "vacancy-serp__vacancy-date", "vacancy-serp__publication-date"
-        )
+        published = _first(context, "vacancy-serp__vacancy-date", "vacancy-serp__publication-date")
         found.setdefault(
             hh_id,
             SearchItem(
@@ -552,8 +557,7 @@ def parse_vacancy_page(
     }
     archived = bool(archived_nodes) or "вакансия в архиве" in leaf_texts
     unavailable = bool(unavailable_nodes) or bool(
-        leaf_texts
-        & {"вакансия недоступна", "вакансия удалена", "страница не найдена"}
+        leaf_texts & {"вакансия недоступна", "вакансия удалена", "страница не найдена"}
     )
     title_field = _field(root, "vacancy-title", "vacancy-title-text")
     salary_field = _field(root, "vacancy-salary", "vacancy-salary-compensation-type-net")
@@ -660,9 +664,7 @@ def parse_vacancy_page(
             if value is not None:
                 published_at = value
                 published_text = published_text or str(raw)
-                published_state = ExtractedField(
-                    value=str(raw), state="value", source=source_name
-                )
+                published_state = ExtractedField(value=str(raw), state="value", source=source_name)
                 break
     if published_at is None and published_state.state == "value":
         published_state = ExtractedField(

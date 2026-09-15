@@ -214,7 +214,7 @@ class ParserTests(unittest.TestCase):
     def test_hidden_terminal_templates_do_not_mark_active_vacancy_closed(self):
         result = parse_vacancy_page(
             '<div style="display:none"><span>Вакансия в архиве</span>'
-            '<span>Страница не найдена</span></div>'
+            "<span>Страница не найдена</span></div>"
             '<h1 data-qa="vacancy-title">HR Lead</h1>'
             '<div data-qa="vacancy-description">Полная занятость, удалённая работа</div>',
             "https://hh.ru/vacancy/12",

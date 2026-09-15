@@ -53,9 +53,7 @@ async def test_batch_accepts_exactly_1000_unique_ids_with_duplicates_and_errors(
         *(SearchItem(str(i), f"https://hh.ru/vacancy/{i}") for i in range(600, 1001)),
     ]
     first_pages = [SearchPage(first[i : i + 200], FIRST_URL) for i in range(0, 600, 200)]
-    second_pages = [
-        SearchPage(second[i : i + 200], SECOND_URL) for i in range(0, len(second), 200)
-    ]
+    second_pages = [SearchPage(second[i : i + 200], SECOND_URL) for i in range(0, len(second), 200)]
     first_pages[-1].next_url = None
     second_pages[-1].next_url = None
     PageBrowser.pages_by_url = {FIRST_URL: first_pages, SECOND_URL: second_pages}
@@ -269,9 +267,7 @@ async def test_old_parser_version_invalidates_fresh_detail_cache(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_second_run_reuses_processed_vacancy_despite_listing_mismatch(
-    tmp_path, monkeypatch
-):
+async def test_second_run_reuses_processed_vacancy_despite_listing_mismatch(tmp_path, monkeypatch):
     collector = Collector(tmp_path)
 
     class RepeatedBrowser(PageBrowser):
@@ -281,9 +277,7 @@ async def test_second_run_reuses_processed_vacancy_despite_listing_mismatch(
         async def iter_search_pages(self, url):
             type(self).searches += 1
             title = "Original listing" if self.searches == 1 else "Changed listing"
-            yield SearchPage(
-                [SearchItem("1", "https://hh.ru/vacancy/1", title=title)], None
-            ), url
+            yield SearchPage([SearchItem("1", "https://hh.ru/vacancy/1", title=title)], None), url
 
         async def fetch_html(self, url, *, readiness):
             type(self).fetches += 1
@@ -552,9 +546,7 @@ async def test_persisted_navigation_interval_configures_browser(tmp_path, monkey
     ConfiguredBrowser.pages_by_url = {SEARCH_URL: [SearchPage([], None)]}
     monkeypatch.setattr("hhmcp.service.BrowserAdapter", ConfiguredBrowser)
     collector = Collector(tmp_path)
-    run_id = collector.start(
-        [SearchSpec(url=SEARCH_URL)], navigation_interval_seconds=1.75
-    )
+    run_id = collector.start([SearchSpec(url=SEARCH_URL)], navigation_interval_seconds=1.75)
 
     await collector.collect(run_id)
 

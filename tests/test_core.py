@@ -35,9 +35,7 @@ def test_search_spec_sources_are_exclusive():
 
 
 def test_structured_search_url_supports_moscow_and_multiple_values():
-    url = search_url(
-        SearchSpec(text="HR Lead", area=["1", "2"], employment=["full"])
-    )
+    url = search_url(SearchSpec(text="HR Lead", area=["1", "2"], employment=["full"]))
     assert "area=1" in url and "area=2" in url and "employment=full" in url
 
 
@@ -187,7 +185,7 @@ def test_version_one_database_is_migrated_with_progress(tmp_path):
     assert "progress_json" in columns
     assert "vacancy_cache_ttl_hours" in columns
     assert "navigation_interval_seconds" in columns
-    assert version == "3"
+    assert version == "5"
 
 
 def test_version_two_database_is_migrated_with_collection_settings(tmp_path):
@@ -214,7 +212,31 @@ def test_version_two_database_is_migrated_with_collection_settings(tmp_path):
         columns = {row[1] for row in con.execute("PRAGMA table_info(runs)")}
         version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
     assert {"vacancy_cache_ttl_hours", "navigation_interval_seconds"} <= columns
-    assert version == "3"
+    assert version == "5"
+
+
+def test_version_four_database_adds_per_search_stop_reason(tmp_path):
+    path = tmp_path / "v4.sqlite"
+    db = Database(path)
+    with db.connect() as con:
+        con.execute("UPDATE meta SET value='4' WHERE key='schema_version'")
+        con.execute("ALTER TABLE run_searches RENAME TO old_run_searches")
+        con.execute(
+            """CREATE TABLE run_searches(
+               run_id TEXT NOT NULL, position INTEGER NOT NULL, spec_json TEXT NOT NULL,
+               normalized_query TEXT NOT NULL, original_url TEXT, final_url TEXT,
+               applied_filters_json TEXT, complete INTEGER NOT NULL DEFAULT 0,
+               PRIMARY KEY(run_id, position))"""
+        )
+        con.execute("DROP TABLE old_run_searches")
+
+    Database(path)
+
+    with sqlite3.connect(path) as con:
+        columns = {row[1] for row in con.execute("PRAGMA table_info(run_searches)")}
+        version = con.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()[0]
+    assert "stop_reason" in columns
+    assert version == "5"
 
 
 def test_csv_formula_protection_and_unicode(tmp_path):

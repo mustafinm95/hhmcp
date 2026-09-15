@@ -6,7 +6,7 @@ from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 5
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -17,12 +17,15 @@ CREATE TABLE IF NOT EXISTS runs(
  discovered INTEGER NOT NULL DEFAULT 0, accepted INTEGER NOT NULL DEFAULT 0,
  loaded INTEGER NOT NULL DEFAULT 0, cached INTEGER NOT NULL DEFAULT 0, errors INTEGER NOT NULL DEFAULT 0,
  progress_json TEXT NOT NULL DEFAULT '{}', vacancy_cache_ttl_hours INTEGER NOT NULL DEFAULT 24,
- navigation_interval_seconds REAL NOT NULL DEFAULT 1.0
+ navigation_interval_seconds REAL NOT NULL DEFAULT 1.0,
+ per_search_limit INTEGER, collection_strategy TEXT NOT NULL DEFAULT 'round_robin',
+ fetch_details TEXT NOT NULL DEFAULT 'all', shortlist_size INTEGER NOT NULL DEFAULT 30,
+ timezone TEXT NOT NULL DEFAULT 'Europe/Moscow', revision INTEGER NOT NULL DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS run_searches(
  run_id TEXT NOT NULL REFERENCES runs(id), position INTEGER NOT NULL, spec_json TEXT NOT NULL,
  normalized_query TEXT NOT NULL, original_url TEXT, final_url TEXT, applied_filters_json TEXT,
- complete INTEGER NOT NULL DEFAULT 0, PRIMARY KEY(run_id, position)
+ complete INTEGER NOT NULL DEFAULT 0, stop_reason TEXT, PRIMARY KEY(run_id, position)
 );
 CREATE TABLE IF NOT EXISTS jobs(
  id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL REFERENCES runs(id), kind TEXT NOT NULL,
@@ -46,6 +49,7 @@ CREATE TABLE IF NOT EXISTS vacancy_versions(
 CREATE TABLE IF NOT EXISTS run_vacancies(
  run_id TEXT NOT NULL REFERENCES runs(id), search_position INTEGER NOT NULL, vacancy_id TEXT NOT NULL,
  discovered_at TEXT NOT NULL, accepted INTEGER NOT NULL DEFAULT 0, outcome TEXT,
+ observed_json TEXT NOT NULL DEFAULT '{}', period_match INTEGER,
  PRIMARY KEY(run_id, search_position, vacancy_id)
 );
 CREATE TABLE IF NOT EXISTS saved_searches(name TEXT PRIMARY KEY, spec_json TEXT NOT NULL, created_at TEXT NOT NULL);
@@ -53,6 +57,9 @@ CREATE TABLE IF NOT EXISTS excluded_employers(employer_id TEXT PRIMARY KEY, crea
 CREATE TABLE IF NOT EXISTS profiles(id TEXT PRIMARY KEY, name TEXT NOT NULL, data_json TEXT NOT NULL);
 CREATE TABLE IF NOT EXISTS similar_vacancies(a TEXT NOT NULL, b TEXT NOT NULL, score REAL NOT NULL,
  PRIMARY KEY(a,b));
+CREATE TABLE IF NOT EXISTS recommendation_snapshots(
+ id TEXT PRIMARY KEY, fingerprint TEXT NOT NULL, items_json TEXT NOT NULL, created_at TEXT NOT NULL
+);
 CREATE VIRTUAL TABLE IF NOT EXISTS vacancy_fts USING fts5(vacancy_id UNINDEXED, title, description, employer, skills);
 CREATE INDEX IF NOT EXISTS jobs_run_state ON jobs(run_id,state);
 CREATE INDEX IF NOT EXISTS run_vacancies_vid ON run_vacancies(vacancy_id);
@@ -115,6 +122,34 @@ class Database:
                         "ALTER TABLE runs ADD COLUMN navigation_interval_seconds "
                         "REAL NOT NULL DEFAULT 1.0"
                     )
+            if previous < 4:
+                run_columns = {item[1] for item in con.execute("PRAGMA table_info(runs)")}
+                additions = {
+                    "per_search_limit": "INTEGER",
+                    "collection_strategy": "TEXT NOT NULL DEFAULT 'round_robin'",
+                    "fetch_details": "TEXT NOT NULL DEFAULT 'all'",
+                    "shortlist_size": "INTEGER NOT NULL DEFAULT 30",
+                    "timezone": "TEXT NOT NULL DEFAULT 'Europe/Moscow'",
+                    "revision": "INTEGER NOT NULL DEFAULT 0",
+                }
+                for name, definition in additions.items():
+                    if name not in run_columns:
+                        con.execute(f"ALTER TABLE runs ADD COLUMN {name} {definition}")
+                membership_columns = {
+                    item[1] for item in con.execute("PRAGMA table_info(run_vacancies)")
+                }
+                if "observed_json" not in membership_columns:
+                    con.execute(
+                        "ALTER TABLE run_vacancies ADD COLUMN observed_json TEXT NOT NULL DEFAULT '{}'"
+                    )
+                if "period_match" not in membership_columns:
+                    con.execute("ALTER TABLE run_vacancies ADD COLUMN period_match INTEGER")
+            if previous < 5:
+                search_columns = {
+                    item[1] for item in con.execute("PRAGMA table_info(run_searches)")
+                }
+                if "stop_reason" not in search_columns:
+                    con.execute("ALTER TABLE run_searches ADD COLUMN stop_reason TEXT")
             if row:
                 con.execute(
                     "UPDATE meta SET value=? WHERE key='schema_version'", (str(SCHEMA_VERSION),)

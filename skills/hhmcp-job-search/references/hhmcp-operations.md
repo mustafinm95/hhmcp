@@ -1,6 +1,6 @@
 # Операции и ограничения hhmcp
 
-Проверено по исходникам hhmcp 2026-09-14: `src/hhmcp/mcp_server.py`, `models.py`, `service.py`, `ranking.py`, `parsing.py` и README. Это ориентир, а не замена актуальным схемам подключённых инструментов. Не требуй наличия репозитория для обычного использования MCP.
+Проверено по исходникам hhmcp 2026-09-15: `src/hhmcp/mcp_server.py`, `models.py`, `service.py`, `ranking.py`, `parsing.py` и README. Это ориентир, а не замена актуальным схемам подключённых инструментов. Не требуй наличия репозитория для обычного использования MCP.
 
 ## Маршрут подбора
 
@@ -8,18 +8,19 @@
 | --- | --- |
 | Посмотреть выбранный профиль | `list_profiles`, `get_profile` |
 | Просмотреть сохранённые поиски | `list_saved_searches` |
-| Собрать публичные вакансии | `start_collection(searches, limit, refresh)` или `run_saved_searches(names, limit, refresh)` |
-| Проверить состояние | `collection_status(run_id)` |
-| Получить результаты запуска | `collection_results(run_id, limit, offset)` |
+| Собрать публичные вакансии | `start_collection(..., fetch_details, shortlist_size, per_search_limit, global_limit)` или `run_saved_searches(...)` |
+| Проверить состояние | `collection_status(run_id)` или `wait_collection(run_id, after_revision, timeout_ms)` |
+| Получить результаты запуска | `collection_results(run_id, limit, offset, view, fields)` |
 | Найти в локальной библиотеке | `list_vacancies(query, status, favorite, tags, employer_id, work_format, limit, offset)` |
-| Прочитать полную карточку | `get_vacancy(vacancy_id)` |
+| Прочитать карточки | `get_vacancy(vacancy_id, view, fields)` или `get_vacancies(vacancy_ids, view, fields)` |
 | Обновить карточку | `refresh_vacancy(vacancy_id)` |
-| Оценить по сохранённому профилю | `rank_vacancy(vacancy_id, profile_id)` |
+| Оценить по сохранённому профилю | `rank_vacancy(...)` или `rank_vacancies(profile_id, vacancy_ids, top_k, explain)` |
+| Продолжить подборку | `recommend_vacancies(profile_id, run_ids, limit, cursor, exclude_vacancy_ids, categories)` |
 | Сохранить по поручению | `save_profile(profile)`, `save_search(name, search)` |
 
-Для shortlist читай полные карточки: `list_vacancies` убирает описание. Чтение `get_vacancy` обращается к библиотеке, само не загружает отсутствующую вакансию из сети. Получай страницы через `offset`, если первая страница не покрывает нужную выборку. `rank_vacancy` оценивает одну вакансию; готовой операции «рейтинг всех» нет.
+Для больших поисков предпочитай `fetch_details="shortlist"`, представление `assessment` и пакетное ранжирование. Чтение карточки обращается к библиотеке и само не загружает отсутствующую вакансию из сети.
 
-MCP-сбор возвращает `run_id` сразу, это не завершённый результат. Проверяй статус с разумными интервалами, затем результаты. Поле `progress` показывает фазу, текущий запрос и страницу, активные карточки и размер очереди. Состояние `completed` само по себе не доказывает полноту: смотри `complete`, `stop_reason` и счётчики. При лимите или ошибках показывай частичный результат. Максимум — 1000 уникальных hh ID на весь запуск, а не на каждый поиск. Один каталог данных допускает один сборщик; при `collector_busy` не запускай второй. Завершение MCP-сервера прерывает работника. CLI выполняет сбор синхронно.
+MCP-сбор возвращает `run_id` сразу, это не завершённый результат. Используй короткий статус или `wait_collection`, затем результаты. Подробный прогресс доступен через `verbose=true`. Состояние `completed` само по себе не доказывает полноту: смотри `complete`, `stop_reason` и счётчики. При лимите или ошибках показывай частичный результат. Новые запуски во время активного сбора ставятся в очередь. Завершение MCP-сервера прерывает работника. CLI выполняет сбор синхронно.
 
 При CAPTCHA/блокировке сообщи причину паузы и необходимость ручного действия. Не повторяй автоматически один и тот же заблокированный запуск. `resume_collection` не решает CAPTCHA. Видимый браузер для ручного восстановления описан как библиотечный `BrowserAdapter.visible_resume()`, а не отдельный MCP-инструмент.
 
@@ -27,7 +28,7 @@ MCP-сбор возвращает `run_id` сразу, это не заверш�
 
 Один `SearchSpec` содержит **либо** `url` публичной HTTPS-выдачи hh.ru с путём `/search/vacancy`, **либо** структурированные фильтры. Не смешивай эти варианты. Новые пожелания к URL проверяй по карточкам либо явно перестрой поиск, сохранив смысл исходных фильтров.
 
-Поддерживаемые поля: `text`, `exclude` (список строк), `area` (список строковых ID), `salary` (число), `experience` (строка), `employment`, `schedule`, `working_hours`, `work_format` (списки строк), `period` (дни), `order_by`.
+Поддерживаемые поля: `text`, `exclude` (список строк), `area` (список строковых ID), `salary` (число), `experience` (строка), `employment`, `schedule`, `working_hours`, `work_format` (списки строк), `period` (дни), `order_by`, а также `search_field`, `match_mode`, `title_aliases`, `title_include` и `title_exclude`.
 
 Проверенные коды:
 

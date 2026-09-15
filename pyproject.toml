@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hhmcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "Local CLI and MCP server for collecting and organizing public hh.ru vacancies"
 readme = "README.md"
 requires-python = ">=3.12"

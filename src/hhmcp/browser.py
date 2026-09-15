@@ -44,7 +44,9 @@ class NavigationLimiter:
             self._next_start = max(self._next_start, time.monotonic() + seconds)
 
 
-def retained_search_filters(request_url: str, final_url: str) -> tuple[dict[str, list[str]], list[str]]:
+def retained_search_filters(
+    request_url: str, final_url: str
+) -> tuple[dict[str, list[str]], list[str]]:
     ignored = {"page", "search_session_id", "hhtmFrom"}
     requested = {
         key: values
@@ -298,9 +300,9 @@ class BrowserAdapter:
         if await publication.count():
             node = publication.first
             result["published_text"] = (await node.inner_text()).strip()
-            result["published_at"] = await node.get_attribute("datetime") or await node.get_attribute(
-                "content"
-            )
+            result["published_at"] = await node.get_attribute(
+                "datetime"
+            ) or await node.get_attribute("content")
         return result
 
     async def _wait_ready(self, readiness: str) -> None:
@@ -347,8 +349,7 @@ class BrowserAdapter:
             if await terminal.count():
                 return
             details = self._page.locator(
-                '[data-qa="vacancy-description"]:visible, '
-                '[data-qa="vacancy-company-name"]:visible'
+                '[data-qa="vacancy-description"]:visible, [data-qa="vacancy-company-name"]:visible'
             )
             await details.first.wait_for(state="visible", timeout=self.timeout_ms)
             return

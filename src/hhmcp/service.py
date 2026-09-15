@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import re
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from urllib.parse import parse_qs, urlencode, urlparse
 
+from .assessment import analyze_vacancy
 from .browser import BrowserAdapter, BrowserBlocked, PageNotReady
 from .db import Database
 from .lock import CollectorLock
@@ -51,7 +53,13 @@ def search_url(spec: SearchSpec) -> str:
         raise ValueError("unsupported period")
     params: list[tuple[str, str]] = []
     if spec.text:
-        params.append(("text", spec.text))
+        search_text = spec.text
+        if spec.match_mode == "title_aliases":
+            terms = list(dict.fromkeys([spec.text, *spec.title_aliases]))
+            search_text = " OR ".join(f'"{term}"' for term in terms)
+        params.append(("text", search_text))
+    if spec.search_field == "title" or spec.match_mode in {"exact_title", "title_aliases"}:
+        params.append(("search_field", "name"))
     for value in spec.exclude:
         params.append(("excluded_text", value))
     params += [("area", a) for a in spec.area]
@@ -68,6 +76,29 @@ def search_url(spec: SearchSpec) -> str:
     return "https://hh.ru/search/vacancy?" + urlencode(params)
 
 
+def _normalized_title(value: str | None) -> str:
+    return re.sub(r"[^\w]+", " ", value or "", flags=re.UNICODE).casefold().strip()
+
+
+def _title_matches(spec: SearchSpec, title: str | None) -> bool:
+    normalized = _normalized_title(title)
+    includes = [_normalized_title(value) for value in spec.title_include]
+    excludes = [_normalized_title(value) for value in spec.title_exclude]
+    if includes and not any(value in normalized for value in includes):
+        return False
+    if any(value and value in normalized for value in excludes):
+        return False
+    query = _normalized_title(spec.text)
+    if spec.match_mode == "exact_title":
+        return normalized == query
+    if spec.match_mode == "title_aliases":
+        aliases = [_normalized_title(value) for value in [spec.text, *spec.title_aliases]]
+        return any(value == normalized for value in aliases)
+    if spec.match_mode == "phrase" or spec.search_field == "title":
+        return not query or query in normalized
+    return True
+
+
 class Collector:
     def __init__(self, data_dir: Path, *, headless: bool = True):
         self.data_dir = data_dir
@@ -82,18 +113,30 @@ class Collector:
         *,
         vacancy_cache_ttl_hours: int = 24,
         navigation_interval_seconds: float = 1.0,
+        per_search_limit: int | None = None,
+        collection_strategy: str = "round_robin",
+        fetch_details: str = "all",
+        shortlist_size: int = 30,
+        timezone: str = "Europe/Moscow",
     ) -> str:
         return self.repo.create_run(
             specs,
             limit,
             vacancy_cache_ttl_hours=vacancy_cache_ttl_hours,
             navigation_interval_seconds=navigation_interval_seconds,
+            per_search_limit=per_search_limit,
+            collection_strategy=collection_strategy,
+            fetch_details=fetch_details,
+            shortlist_size=shortlist_size,
+            timezone=timezone,
         ).id
 
-    def cancel(self, run_id: str) -> None:
+    def cancel(self, run_id: str) -> int:
         self.cancelled.add(run_id)
         self.repo.set_run_state(run_id, "cancelled", "cancelled by user", False)
+        cancelled = self.repo.cancel_pending_jobs(run_id)
         self.finish_progress(run_id)
+        return cancelled
 
     def finish_progress(self, run_id: str, *, paused: bool = False) -> None:
         progress = self.repo.get_run(run_id).progress
@@ -215,9 +258,7 @@ class Collector:
                         return
                     payload = json.loads(job["payload_json"])
                     observed = payload.get("observed") or {}
-                    active_vacancy = ActiveVacancy(
-                        hh_id=job["target"], title=observed.get("title")
-                    )
+                    active_vacancy = ActiveVacancy(hh_id=job["target"], title=observed.get("title"))
                     async with progress_lock:
                         if progress.current_search is None:
                             progress.phase = "loading_vacancies"
@@ -258,7 +299,10 @@ class Collector:
                 active = list(page_iters)
                 while active and not limit_reached and not stop_workers.is_set():
                     for pos in list(active):
-                        if run_id in self.cancelled or self.repo.get_run(run_id).state == "cancelled":
+                        if (
+                            run_id in self.cancelled
+                            or self.repo.get_run(run_id).state == "cancelled"
+                        ):
                             stop_workers.set()
                             break
                         progress.phase = "discovering"
@@ -269,11 +313,7 @@ class Collector:
                         except StopAsyncIteration:
                             active.remove(pos)
                             searches[pos].complete = True
-                            with self.repo.db.transaction() as con:
-                                con.execute(
-                                    "UPDATE run_searches SET complete=1 WHERE run_id=? AND position=?",
-                                    (run_id, pos),
-                                )
+                            self.repo.complete_search(run_id, pos)
                             await save_progress(force=True)
                             continue
                         except BrowserBlocked as exc:
@@ -313,9 +353,12 @@ class Collector:
                                 },
                             }
                             for item in page.items
+                            if _title_matches(run.search_specs[pos], item.title)
                         ]
                         page_complete = page.next_url is None
-                        checkpoint_url = page.next_url if page.next_url and not page_complete else final_url
+                        checkpoint_url = (
+                            page.next_url if page.next_url and not page_complete else final_url
+                        )
                         results = self.repo.record_page_observations(
                             run_id,
                             pos,
@@ -333,10 +376,12 @@ class Collector:
                                 "unchecked": page.unchecked_parameters,
                             },
                             complete=page_complete,
+                            per_search_limit=run.per_search_limit,
+                            enqueue_details=run.fetch_details == "all",
                         )
                         page_complete = page_complete and len(results) == len(observations)
                         for result in results:
-                            if result["discovered"]:
+                            if result["search_discovered"]:
                                 searches[pos].discovered += 1
                             if result["accepted"]:
                                 accepted_count += 1
@@ -345,15 +390,24 @@ class Collector:
                             if accepted_count >= run.limit:
                                 limit_reached = True
                                 break
+                        searches[pos].unique = searches[pos].discovered
+                        if (
+                            run.per_search_limit is not None
+                            and searches[pos].discovered >= run.per_search_limit
+                        ):
+                            searches[pos].complete = True
+                            searches[pos].stop_reason = "per_search_limit reached"
+                            self.repo.complete_search(run_id, pos, "per_search_limit reached")
+                            if pos in active:
+                                active.remove(pos)
                         if page_complete:
                             searches[pos].complete = True
-                            active.remove(pos)
+                            if pos in active:
+                                active.remove(pos)
                         elif page.next_url and not limit_reached:
                             searches[pos].url = page.next_url
                             searches[pos].page = (
-                                int(
-                                    parse_qs(urlparse(page.next_url).query).get("page", ["0"])[0]
-                                )
+                                int(parse_qs(urlparse(page.next_url).query).get("page", ["0"])[0])
                                 + 1
                             )
                         await save_progress()
@@ -370,13 +424,16 @@ class Collector:
                     return
                 progress.current_search = None
                 progress.phase = "loading_vacancies"
+                if run.fetch_details == "shortlist":
+                    for job in self.repo.enqueue_shortlist(run_id, run.shortlist_size):
+                        await queue.put(job)
                 await save_progress(force=True)
                 join_task = asyncio.create_task(queue.join())
                 stop_task = asyncio.create_task(stop_workers.wait())
                 done, _ = await asyncio.wait(
                     {join_task, stop_task}, return_when=asyncio.FIRST_COMPLETED
                 )
-                for task in ({join_task, stop_task} - done):
+                for task in {join_task, stop_task} - done:
                     task.cancel()
                 if stop_workers.is_set():
                     progress.phase = "paused"
@@ -399,13 +456,29 @@ class Collector:
                 progress.pending_details = 0
                 await save_progress(force=True)
             finally:
+                cancelling = bool(asyncio.current_task() and asyncio.current_task().cancelling())
+                cancelled = cancelling or run_id in self.cancelled
+                if cancelled:
+                    stop_workers.set()
+                    while True:
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            break
+                        else:
+                            queue.task_done()
+                    for worker_task in workers:
+                        worker_task.cancel()
                 for iterator in page_iters.values():
                     close = getattr(iterator, "aclose", None)
                     if close:
                         await close()
-                for _ in workers:
-                    await queue.put(None)
+                if not cancelled:
+                    for _ in workers:
+                        await queue.put(None)
                 await asyncio.gather(*workers, return_exceptions=True)
+                if cancelled:
+                    self.repo.cancel_pending_jobs(run_id)
                 for worker_browser in worker_browsers:
                     if worker_browser is not browser and hasattr(worker_browser, "close_page"):
                         await worker_browser.close_page()
@@ -422,7 +495,7 @@ class Collector:
         observed = payload.get("observed")
         self.repo.start_job(job["id"])
         try:
-            _, from_cache = await self._load_vacancy(
+            vacancy, from_cache = await self._load_vacancy(
                 browser,
                 job["target"],
                 payload.get("url") or f"https://hh.ru/vacancy/{job['target']}",
@@ -433,6 +506,7 @@ class Collector:
             )
             if from_cache:
                 self.repo.finish_job(job["id"], "cached")
+            self.repo.apply_period_filter(run_id, vacancy)
             return True
         except BrowserBlocked as exc:
             self.repo.finish_job(job["id"], "queued", str(exc))
@@ -537,6 +611,7 @@ class Collector:
             availability=parsed.availability,
             field_states=states,
         )
+        vacancy.assessment, vacancy.diagnostics = analyze_vacancy(vacancy)
         if job_id is not None:
             with self.repo.db.connect() as con:
                 discovered = con.execute(

@@ -6,11 +6,13 @@ import math
 import re
 import sqlite3
 import uuid
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from .db import Database, utcnow
 from .models import CandidateProfile, Employer, Run, RunProgress, RunState, SearchSpec, Vacancy
+from .parsing import parse_published_at
 
 LOCAL_STATUSES = {"новое", "интересно", "откликнулся", "интервью", "предложение", "отказ", "скрыто"}
 MEANINGFUL = {
@@ -71,6 +73,11 @@ class Repository:
         *,
         vacancy_cache_ttl_hours: int = 24,
         navigation_interval_seconds: float = 1.0,
+        per_search_limit: int | None = None,
+        collection_strategy: str = "round_robin",
+        fetch_details: str = "all",
+        shortlist_size: int = 30,
+        timezone: str = "Europe/Moscow",
     ) -> Run:
         if not 1 <= limit <= 1000:
             raise ValueError("limit must be between 1 and 1000")
@@ -78,13 +85,22 @@ class Repository:
             raise ValueError("vacancy_cache_ttl_hours must be non-negative")
         if not math.isfinite(navigation_interval_seconds) or navigation_interval_seconds < 1:
             raise ValueError("navigation_interval_seconds must be at least 1")
+        if per_search_limit is not None and not 1 <= per_search_limit <= 1000:
+            raise ValueError("per_search_limit must be between 1 and 1000")
+        if collection_strategy != "round_robin":
+            raise ValueError("only round_robin collection_strategy is supported")
+        if fetch_details not in {"all", "shortlist", "none"}:
+            raise ValueError("fetch_details must be all, shortlist, or none")
+        if not 1 <= shortlist_size <= 1000:
+            raise ValueError("shortlist_size must be between 1 and 1000")
         run_id, now = str(uuid.uuid4()), utcnow()
         with self.db.transaction() as con:
             con.execute(
                 """INSERT INTO runs(
                    id,state,created_at,updated_at,limit_count,
-                   vacancy_cache_ttl_hours,navigation_interval_seconds
-                   ) VALUES(?,?,?,?,?,?,?)""",
+                   vacancy_cache_ttl_hours,navigation_interval_seconds,per_search_limit,
+                   collection_strategy,fetch_details,shortlist_size,timezone
+                   ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (
                     run_id,
                     "queued",
@@ -93,6 +109,11 @@ class Repository:
                     limit,
                     vacancy_cache_ttl_hours,
                     navigation_interval_seconds,
+                    per_search_limit,
+                    collection_strategy,
+                    fetch_details,
+                    shortlist_size,
+                    timezone,
                 ),
             )
             for pos, spec in enumerate(specs):
@@ -128,9 +149,24 @@ class Repository:
             errors=row["errors"],
             vacancy_cache_ttl_hours=row["vacancy_cache_ttl_hours"],
             navigation_interval_seconds=row["navigation_interval_seconds"],
+            per_search_limit=row["per_search_limit"],
+            collection_strategy=row["collection_strategy"],
+            fetch_details=row["fetch_details"],
+            shortlist_size=row["shortlist_size"],
+            timezone=row["timezone"],
+            revision=row["revision"],
             search_specs=specs,
             progress=RunProgress.model_validate_json(row["progress_json"] or "{}"),
         )
+
+    def queued_run_ids(self) -> list[str]:
+        with self.db.connect() as con:
+            return [
+                row[0]
+                for row in con.execute(
+                    "SELECT id FROM runs WHERE state='queued' ORDER BY created_at,id"
+                )
+            ]
 
     def update_run_settings(
         self,
@@ -163,7 +199,7 @@ class Repository:
     def set_progress(self, run_id: str, progress: RunProgress) -> None:
         with self.db.transaction() as con:
             con.execute(
-                "UPDATE runs SET progress_json=?,updated_at=? WHERE id=?",
+                "UPDATE runs SET progress_json=?,updated_at=?,revision=revision+1 WHERE id=?",
                 (progress.model_dump_json(), utcnow(), run_id),
             )
 
@@ -174,7 +210,14 @@ class Repository:
         reason: str | None = None,
         complete: bool | None = None,
     ) -> None:
-        sets, args = ["state=?", "updated_at=?", "stop_reason=?"], [str(state), utcnow(), reason]
+        sets, args = (
+            ["state=?", "updated_at=?", "stop_reason=?", "revision=revision+1"],
+            [
+                str(state),
+                utcnow(),
+                reason,
+            ],
+        )
         if complete is not None:
             sets.append("complete=?")
             args.append(int(complete))
@@ -189,7 +232,7 @@ class Repository:
         sql = ",".join(f"{k}={k}+?" for k in counts)
         with self.db.transaction() as con:
             con.execute(
-                f"UPDATE runs SET {sql},updated_at=? WHERE id=?",
+                f"UPDATE runs SET {sql},updated_at=?,revision=revision+1 WHERE id=?",
                 (*counts.values(), utcnow(), run_id),
             )
 
@@ -267,16 +310,38 @@ class Repository:
         checkpoint_url: str,
         applied_filters: dict[str, Any],
         complete: bool,
+        per_search_limit: int | None = None,
+        enqueue_details: bool = True,
     ) -> list[dict[str, Any]]:
         """Record one search page and return only jobs that require detail loading."""
         results: list[dict[str, Any]] = []
+        run = self.get_run(run_id)
+        spec = run.search_specs[pos]
+        now = datetime.now(ZoneInfo(run.timezone))
+
+        def period_match_for(value: datetime | str | None) -> bool | None:
+            if spec.period is None:
+                return None
+            published = value if isinstance(value, datetime) else parse_published_at(value, now=now)
+            if published is None:
+                return None
+            cutoff_date = now.date() - timedelta(days=spec.period - 1)
+            cutoff = datetime.combine(cutoff_date, datetime.min.time(), now.tzinfo)
+            return published.astimezone(now.tzinfo) >= cutoff
+
         with self.db.transaction() as con:
             accepted_count = con.execute(
                 "SELECT accepted FROM runs WHERE id=?", (run_id,)
             ).fetchone()[0]
+            search_count = con.execute(
+                "SELECT COUNT(*) FROM run_vacancies WHERE run_id=? AND search_position=?",
+                (run_id, pos),
+            ).fetchone()[0]
             discovered_delta = accepted_delta = cached_delta = 0
             for observation in observations:
-                if accepted_count >= limit:
+                if accepted_count >= limit or (
+                    per_search_limit is not None and search_count >= per_search_limit
+                ):
                     break
                 vacancy_id = observation["vacancy_id"]
                 previous = con.execute(
@@ -284,6 +349,13 @@ class Repository:
                        WHERE run_id=? AND vacancy_id=? ORDER BY accepted DESC""",
                     (run_id, vacancy_id),
                 ).fetchall()
+                membership_exists = bool(
+                    con.execute(
+                        """SELECT 1 FROM run_vacancies
+                           WHERE run_id=? AND search_position=? AND vacancy_id=?""",
+                        (run_id, pos, vacancy_id),
+                    ).fetchone()
+                )
                 discovered = not previous
                 already_accepted = any(bool(row["accepted"]) for row in previous)
                 accepted = not already_accepted
@@ -291,22 +363,45 @@ class Repository:
                     (row["outcome"] for row in previous if row["outcome"] is not None), None
                 )
                 cached = False
+                cached_data = None
                 if accepted and cache_cutoff is not None:
-                    cached = bool(
-                        con.execute(
-                            """SELECT 1 FROM vacancies
-                               WHERE hh_id=? AND julianday(fetched_at)>=julianday(?)
-                               AND parser_version=?""",
-                            (vacancy_id, cache_cutoff, parser_version),
-                        ).fetchone()
-                    )
+                    cached_row = con.execute(
+                        """SELECT data_json FROM vacancies
+                           WHERE hh_id=? AND julianday(fetched_at)>=julianday(?)
+                           AND parser_version=?""",
+                        (vacancy_id, cache_cutoff, parser_version),
+                    ).fetchone()
+                    cached = bool(cached_row)
+                    if cached_row:
+                        cached_data = json.loads(cached_row["data_json"])
                 outcome = "cached" if cached else previous_outcome
+                observed_json = canonical(
+                    {"url": observation["url"], **(observation.get("observed") or {})}
+                )
+                observed = observation.get("observed") or {}
+                period_match = period_match_for(
+                    (cached_data or {}).get("published_at") or observed.get("published_text")
+                )
+                if period_match is False:
+                    outcome = "excluded_period"
                 con.execute(
                     """INSERT OR IGNORE INTO run_vacancies
-                       (run_id,search_position,vacancy_id,discovered_at,accepted,outcome)
-                       VALUES(?,?,?,?,?,?)""",
-                    (run_id, pos, vacancy_id, utcnow(), int(accepted), outcome),
+                       (run_id,search_position,vacancy_id,discovered_at,accepted,outcome,
+                        observed_json,period_match)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (
+                        run_id,
+                        pos,
+                        vacancy_id,
+                        utcnow(),
+                        int(accepted),
+                        outcome,
+                        observed_json,
+                        None if period_match is None else int(period_match),
+                    ),
                 )
+                if not membership_exists:
+                    search_count += 1
                 job = None
                 if accepted:
                     accepted_count += 1
@@ -314,10 +409,17 @@ class Repository:
                     if cached:
                         cached_delta += 1
                         con.execute(
-                            "UPDATE run_vacancies SET outcome='cached' WHERE run_id=? AND vacancy_id=?",
-                            (run_id, vacancy_id),
+                            """UPDATE run_vacancies SET outcome=?,period_match=?
+                               WHERE run_id=? AND search_position=? AND vacancy_id=?""",
+                            (
+                                outcome,
+                                None if period_match is None else int(period_match),
+                                run_id,
+                                pos,
+                                vacancy_id,
+                            ),
                         )
-                    else:
+                    elif enqueue_details:
                         payload = canonical(
                             {
                                 "url": observation["url"],
@@ -340,6 +442,7 @@ class Repository:
                     {
                         "vacancy_id": vacancy_id,
                         "discovered": discovered,
+                        "search_discovered": not membership_exists,
                         "accepted": accepted,
                         "cached": cached,
                         "job": job,
@@ -351,17 +454,74 @@ class Repository:
                 (discovered_delta, accepted_delta, cached_delta, utcnow(), run_id),
             )
             con.execute(
-                """UPDATE run_searches SET final_url=?,applied_filters_json=?,complete=?
+                """UPDATE run_searches SET final_url=?,applied_filters_json=?,complete=?,
+                   stop_reason=CASE WHEN ? THEN NULL ELSE stop_reason END
                    WHERE run_id=? AND position=?""",
                 (
                     checkpoint_url,
                     canonical(applied_filters),
+                    int(complete and len(results) == len(observations)),
                     int(complete and len(results) == len(observations)),
                     run_id,
                     pos,
                 ),
             )
         return results
+
+    def complete_search(self, run_id: str, position: int, reason: str | None = None) -> None:
+        with self.db.transaction() as con:
+            con.execute(
+                """UPDATE run_searches SET complete=1,stop_reason=?
+                   WHERE run_id=? AND position=?""",
+                (reason, run_id, position),
+            )
+
+    def enqueue_shortlist(self, run_id: str, size: int) -> list[sqlite3.Row]:
+        """Choose a deterministic metadata shortlist and enqueue missing details."""
+        with self.db.transaction() as con:
+            rows = con.execute(
+                """SELECT rv.vacancy_id,rv.search_position,rv.discovered_at,rv.observed_json
+                   FROM run_vacancies rv
+                   WHERE rv.run_id=? AND rv.accepted=1
+                     AND COALESCE(rv.outcome,'') NOT IN ('cached','excluded_period')
+                   ORDER BY rv.discovered_at,rv.vacancy_id""",
+                (run_id,),
+            ).fetchall()
+            specs = self.get_run(run_id).search_specs
+            candidates: dict[str, tuple[int, str, dict[str, Any]]] = {}
+            for row in rows:
+                observed = json.loads(row["observed_json"] or "{}")
+                title = re.sub(r"\W+", " ", observed.get("title") or "").casefold()
+                query = re.sub(r"\W+", " ", specs[row["search_position"]].text or "").casefold()
+                score = 4 * int(bool(query and query in title))
+                score += sum(
+                    int(bool(observed.get(field)))
+                    for field in ("title", "employer_name", "salary_text", "published_text")
+                )
+                score += int(bool((observed.get("conditions") or {}).get("work_format")))
+                current = candidates.get(row["vacancy_id"])
+                if current is None or score > current[0]:
+                    candidates[row["vacancy_id"]] = (score, row["discovered_at"], observed)
+            selected = sorted(
+                candidates.items(), key=lambda item: (-item[1][0], item[1][1], item[0])
+            )[:size]
+            for vacancy_id, (_, _, observed) in selected:
+                payload = canonical(
+                    {
+                        "url": observed.pop("url", None) or f"https://hh.ru/vacancy/{vacancy_id}",
+                        "observed": observed,
+                    }
+                )
+                con.execute(
+                    """INSERT OR IGNORE INTO jobs(run_id,kind,target,payload_json)
+                       VALUES(?,?,?,?)""",
+                    (run_id, "vacancy", vacancy_id, payload),
+                )
+            return con.execute(
+                """SELECT * FROM jobs WHERE run_id=? AND kind='vacancy'
+                   AND state IN ('queued','running','error') ORDER BY id""",
+                (run_id,),
+            ).fetchall()
 
     def pending_jobs(self, run_id: str) -> list[sqlite3.Row]:
         with self.db.connect() as con:
@@ -370,6 +530,55 @@ class Repository:
                    AND state IN ('queued','running','error') ORDER BY id""",
                 (run_id,),
             ).fetchall()
+
+    def cancel_pending_jobs(self, run_id: str) -> int:
+        with self.db.transaction() as con:
+            rows = con.execute(
+                """SELECT target FROM jobs
+                   WHERE run_id=? AND state IN ('queued','running')""",
+                (run_id,),
+            ).fetchall()
+            con.execute(
+                """UPDATE jobs SET state='cancelled',error='cancelled by user'
+                   WHERE run_id=? AND state IN ('queued','running')""",
+                (run_id,),
+            )
+            con.execute(
+                """UPDATE run_vacancies SET outcome='cancelled'
+                   WHERE run_id=? AND vacancy_id IN (
+                     SELECT target FROM jobs WHERE run_id=? AND state='cancelled'
+                   ) AND COALESCE(outcome,'') NOT IN ('loaded','cached')""",
+                (run_id, run_id),
+            )
+        return len(rows)
+
+    def apply_period_filter(self, run_id: str, vacancy: Vacancy) -> None:
+        run = self.get_run(run_id)
+        now = datetime.now(ZoneInfo(run.timezone))
+        with self.db.transaction() as con:
+            memberships = con.execute(
+                "SELECT search_position FROM run_vacancies WHERE run_id=? AND vacancy_id=?",
+                (run_id, vacancy.hh_id),
+            ).fetchall()
+            for membership in memberships:
+                period = run.search_specs[membership["search_position"]].period
+                match: bool | None = None
+                if period is not None and vacancy.published_at is not None:
+                    cutoff_date = now.date() - timedelta(days=period - 1)
+                    cutoff = datetime.combine(cutoff_date, datetime.min.time(), now.tzinfo)
+                    match = vacancy.published_at.astimezone(now.tzinfo) >= cutoff
+                con.execute(
+                    """UPDATE run_vacancies SET period_match=?,outcome=CASE
+                       WHEN ?=0 THEN 'excluded_period' ELSE outcome END
+                       WHERE run_id=? AND search_position=? AND vacancy_id=?""",
+                    (
+                        None if match is None else int(match),
+                        None if match is None else int(match),
+                        run_id,
+                        membership["search_position"],
+                        vacancy.hh_id,
+                    ),
+                )
 
     def get_job(self, run_id: str, vacancy_id: str) -> sqlite3.Row:
         with self.db.connect() as con:
@@ -404,16 +613,16 @@ class Repository:
             job = con.execute("SELECT run_id,state FROM jobs WHERE id=?", (job_id,)).fetchone()
             if not job:
                 raise KeyError(job_id)
-            con.execute(
-                "UPDATE jobs SET state='running',attempts=attempts+1 WHERE id=?", (job_id,)
-            )
+            con.execute("UPDATE jobs SET state='running',attempts=attempts+1 WHERE id=?", (job_id,))
             self._update_outcome_count(con, job["run_id"], job["state"], "running")
 
     def finish_job(self, job_id: int, state: str, error: str | None = None) -> None:
         if state not in {"loaded", "cached", "error", "queued"}:
             raise ValueError("invalid job outcome")
         with self.db.transaction() as con:
-            job = con.execute("SELECT run_id,target,state FROM jobs WHERE id=?", (job_id,)).fetchone()
+            job = con.execute(
+                "SELECT run_id,target,state FROM jobs WHERE id=?", (job_id,)
+            ).fetchone()
             if not job:
                 raise KeyError(job_id)
             con.execute("UPDATE jobs SET state=?,error=? WHERE id=?", (state, error, job_id))
@@ -605,21 +814,75 @@ class Repository:
     def run_results(self, run_id: str, limit: int = 20, offset: int = 0) -> list[dict[str, Any]]:
         with self.db.connect() as con:
             rows = con.execute(
-                """SELECT v.data_json,MAX(rv.outcome) outcome,
-                          MIN(rv.discovered_at) discovered_at
-                   FROM run_vacancies rv LEFT JOIN vacancies v ON v.hh_id=rv.vacancy_id
+                """SELECT rv.vacancy_id,v.data_json,MAX(rv.outcome) outcome,
+                          MIN(rv.discovered_at) discovered_at,MAX(rv.observed_json) observed_json,
+                          MIN(rv.period_match) period_match
+                   FROM run_vacancies rv
+                   JOIN run_searches rs ON rs.run_id=rv.run_id AND rs.position=rv.search_position
+                   LEFT JOIN vacancies v ON v.hh_id=rv.vacancy_id
                    WHERE rv.run_id=? GROUP BY rv.vacancy_id
+                   HAVING MAX(
+                     CASE WHEN json_extract(rs.spec_json,'$.period') IS NULL
+                               OR rv.period_match=1 THEN 1 ELSE 0 END
+                   )=1
                    ORDER BY discovered_at LIMIT ? OFFSET ?""",
                 (run_id, min(limit, 1000), offset),
             ).fetchall()
         results = []
         for row in rows:
-            data = json.loads(row["data_json"]) if row["data_json"] else {}
-            data.pop("description", None)
+            observed = json.loads(row["observed_json"] or "{}")
+            data = (
+                json.loads(row["data_json"])
+                if row["data_json"]
+                else {
+                    "hh_id": row["vacancy_id"],
+                    "url": observed.get("url") or f"https://hh.ru/vacancy/{row['vacancy_id']}",
+                    "title": observed.get("title"),
+                    "employer_name": observed.get("employer_name"),
+                    "salary_text": observed.get("salary_text"),
+                    "conditions": observed.get("conditions") or {},
+                    "published_text": observed.get("published_text"),
+                }
+            )
             results.append(
-                data | {"outcome": row["outcome"], "discovered_at": row["discovered_at"]}
+                data
+                | {
+                    "outcome": row["outcome"] or "metadata_only",
+                    "discovered_at": row["discovered_at"],
+                    "period_match": (
+                        None if row["period_match"] is None else bool(row["period_match"])
+                    ),
+                }
             )
         return results
+
+    def run_search_stats(self, run_id: str) -> list[dict[str, Any]]:
+        with self.db.connect() as con:
+            rows = con.execute(
+                """SELECT rs.position,rs.spec_json,rs.complete,rs.stop_reason,
+                          COUNT(DISTINCT rv.vacancy_id) discovered,
+                          COUNT(DISTINCT CASE WHEN rv.accepted=1 THEN rv.vacancy_id END) unique_count,
+                          COUNT(DISTINCT CASE WHEN rv.outcome IN ('loaded','cached') THEN rv.vacancy_id END) loaded,
+                          COUNT(DISTINCT CASE WHEN rv.outcome='error' THEN rv.vacancy_id END) errors
+                   FROM run_searches rs LEFT JOIN run_vacancies rv
+                     ON rv.run_id=rs.run_id AND rv.search_position=rs.position
+                   WHERE rs.run_id=? GROUP BY rs.position ORDER BY rs.position""",
+                (run_id,),
+            ).fetchall()
+        return [
+            {
+                "position": row["position"],
+                "search": json.loads(row["spec_json"]),
+                "discovered": row["discovered"],
+                "unique": row["unique_count"],
+                "details_loaded": row["loaded"],
+                "complete": bool(row["complete"]),
+                "stop_reason": row["stop_reason"]
+                or (None if row["complete"] else "run stopped before completion"),
+                "errors": row["errors"],
+            }
+            for row in rows
+        ]
 
     def save_employer(self, employer: Employer) -> None:
         raw = employer.model_dump_json()
@@ -658,6 +921,30 @@ class Repository:
         if not row:
             raise KeyError(profile_id)
         return CandidateProfile.model_validate_json(row[0])
+
+    def save_recommendation_snapshot(self, fingerprint: str, items: list[dict]) -> str:
+        snapshot_id = str(uuid.uuid4())
+        with self.db.transaction() as con:
+            con.execute(
+                "INSERT INTO recommendation_snapshots VALUES(?,?,?,?)",
+                (snapshot_id, fingerprint, canonical(items), utcnow()),
+            )
+            con.execute(
+                """DELETE FROM recommendation_snapshots
+                   WHERE julianday(created_at) < julianday('now','-7 days')"""
+            )
+        return snapshot_id
+
+    def get_recommendation_snapshot(self, snapshot_id: str) -> tuple[str, list[dict]]:
+        with self.db.connect() as con:
+            row = con.execute(
+                """SELECT fingerprint,items_json FROM recommendation_snapshots
+                   WHERE id=?""",
+                (snapshot_id,),
+            ).fetchone()
+        if not row:
+            raise ValueError("recommendation cursor expired or does not exist")
+        return row["fingerprint"], json.loads(row["items_json"])
 
     def exclude_employer(self, employer_id: str, excluded: bool = True) -> None:
         with self.db.transaction() as con:
@@ -728,7 +1015,5 @@ class Repository:
                 matches.append({"vacancy_id": row["hh_id"], "score": round(score, 3)})
         if stored:
             with self.db.transaction() as con:
-                con.executemany(
-                    "INSERT OR REPLACE INTO similar_vacancies VALUES(?,?,?)", stored
-                )
+                con.executemany("INSERT OR REPLACE INTO similar_vacancies VALUES(?,?,?)", stored)
         return sorted(matches, key=lambda x: -x["score"])

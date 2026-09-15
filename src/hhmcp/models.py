@@ -6,7 +6,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
 
-PARSER_VERSION = "2"
+PARSER_VERSION = "3"
 
 
 class FieldState(BaseModel):
@@ -37,6 +37,11 @@ class SearchSpec(BaseModel):
     work_format: list[str] = Field(default_factory=list)
     period: int | None = None
     order_by: str | None = None
+    search_field: Literal["anywhere", "title"] = "anywhere"
+    match_mode: Literal["anywhere", "phrase", "exact_title", "title_aliases"] = "anywhere"
+    title_aliases: list[str] = Field(default_factory=list)
+    title_include: list[str] = Field(default_factory=list)
+    title_exclude: list[str] = Field(default_factory=list)
     unchecked_parameters: list[str] = Field(default_factory=list)
 
     @model_validator(mode="after")
@@ -54,12 +59,17 @@ class SearchSpec(BaseModel):
                 self.work_format,
                 self.period,
                 self.order_by,
+                self.title_aliases,
+                self.title_include,
+                self.title_exclude,
             ]
         )
         if self.url and structured:
             raise ValueError("url and structured filters are mutually exclusive")
         if not self.url and not structured:
             raise ValueError("provide url or at least one structured filter")
+        if self.match_mode == "title_aliases" and not self.title_aliases:
+            raise ValueError("title_aliases is required for title_aliases match_mode")
         return self
 
 
@@ -95,6 +105,8 @@ class Vacancy(BaseModel):
     discovered_at: datetime | None = None
     fetched_at: datetime | None = None
     cache_age_seconds: int | None = None
+    assessment: dict[str, Any] = Field(default_factory=dict)
+    diagnostics: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def synchronize_availability(self):
@@ -125,6 +137,10 @@ class SearchProgress(BaseModel):
     page: int = 0
     complete: bool = False
     discovered: int = 0
+    unique: int = 0
+    loaded: int = 0
+    errors: int = 0
+    stop_reason: str | None = None
 
 
 class ActiveVacancy(BaseModel):
@@ -133,9 +149,7 @@ class ActiveVacancy(BaseModel):
 
 
 class RunProgress(BaseModel):
-    phase: Literal["queued", "discovering", "loading_vacancies", "paused", "finished"] = (
-        "queued"
-    )
+    phase: Literal["queued", "discovering", "loading_vacancies", "paused", "finished"] = "queued"
     current_search: SearchProgress | None = None
     searches: list[SearchProgress] = Field(default_factory=list)
     active_vacancies: list[ActiveVacancy] = Field(default_factory=list)
@@ -157,6 +171,12 @@ class Run(BaseModel):
     errors: int = 0
     vacancy_cache_ttl_hours: int = Field(default=24, ge=0)
     navigation_interval_seconds: float = Field(default=1.0, ge=1)
+    per_search_limit: int | None = Field(default=None, ge=1, le=1000)
+    collection_strategy: Literal["round_robin"] = "round_robin"
+    fetch_details: Literal["all", "shortlist", "none"] = "all"
+    shortlist_size: int = Field(default=30, ge=1, le=1000)
+    timezone: str = "Europe/Moscow"
+    revision: int = 0
     search_specs: list[SearchSpec] = Field(default_factory=list)
     progress: RunProgress = Field(default_factory=RunProgress)
 
